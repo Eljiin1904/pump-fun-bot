@@ -1,74 +1,60 @@
+# src/trading/base.py
 """
 Base interfaces for trading operations.
 """
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass  # Ensure field is imported if needed later
+from typing import Optional  # Ensure Optional is imported
 
 from solders.pubkey import Pubkey
 
-from core.pubkeys import PumpAddresses
 
+# Assuming PumpAddresses might be needed here or defined elsewhere
+# from ..core.pubkeys import PumpAddresses
+# If not directly needed, remove the import
 
 @dataclass
 class TokenInfo:
     """Token information."""
-
+    # Existing fields...
     name: str
     symbol: str
-    uri: str
+    uri: str # Keep if used, often derived or less critical for trading
     mint: Pubkey
     bonding_curve: Pubkey
     associated_bonding_curve: Pubkey
-    user: Pubkey
+    user: Pubkey # Represents the creator address
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TokenInfo":
-        """Create TokenInfo from dictionary.
+    # --- Add timestamp if available from listener ---
+    created_timestamp: Optional[float] = None # UNIX timestamp
 
-        Args:
-            data: Dictionary with token data
+    # --- Add optional fields if fetched ---
+    website: Optional[str] = None
+    twitter: Optional[str] = None
+    telegram: Optional[str] = None
+    description: Optional[str] = None
 
-        Returns:
-            TokenInfo instance
-        """
-        return cls(
-            name=data["name"],
-            symbol=data["symbol"],
-            uri=data["uri"],
-            mint=Pubkey.from_string(data["mint"]),
-            bonding_curve=Pubkey.from_string(data["bondingCurve"]),
-            associated_bonding_curve=Pubkey.from_string(data["associatedBondingCurve"]),
-            user=Pubkey.from_string(data["user"]),
-        )
-
-    def to_dict(self) -> dict[str, str]:
-        """Convert to dictionary.
-
-        Returns:
-            Dictionary representation
-        """
-        return {
-            "name": self.name,
-            "symbol": self.symbol,
-            "uri": self.uri,
-            "mint": str(self.mint),
-            "bondingCurve": str(self.bonding_curve),
-            "associatedBondingCurve": str(self.associated_bonding_curve),
-            "user": str(self.user),
-        }
-
+    # --- Remove Class methods if creation happens elsewhere ---
+    # These might belong in the listener/parser that creates TokenInfo
+    # @classmethod
+    # def from_dict(cls, data: dict[str, Any]) -> "TokenInfo": ...
+    # def to_dict(self) -> dict[str, str]: ...
 
 @dataclass
 class TradeResult:
     """Result of a trading operation."""
-
     success: bool
-    tx_signature: str | None = None
-    error_message: str | None = None
-    amount: float | None = None
-    price: float | None = None
+    tx_signature: Optional[str] = None
+    error_message: Optional[str] = None
+    amount: Optional[float] = None  # Token amount bought/sold (in token units)
+    price: Optional[float] = None  # Price per token in SOL
+
+    # --- Add field for debugging balance check ---
+    final_token_balance_raw: Optional[int] = None
+
+    # --- Add field for initial liquidity check ---
+    initial_sol_liquidity: Optional[int] = None # SOL lamports in curve before buy
 
 
 class Trader(ABC):
@@ -83,19 +69,6 @@ class Trader(ABC):
         """
         pass
 
-    def _get_relevant_accounts(self, token_info: TokenInfo) -> list[Pubkey]:
-        """
-        Get the list of accounts relevant for calculating the priority fee.
-
-        Args:
-            token_info: Token information for the buy/sell operation.
-
-        Returns:
-            list[Pubkey]: List of relevant accounts.
-        """
-        return [
-            token_info.mint,  # Token mint address
-            token_info.bonding_curve,  # Bonding curve address
-            PumpAddresses.PROGRAM,  # Pump.fun program address
-            PumpAddresses.FEE,  # Pump.fun fee account
-        ]
+    # --- Remove _get_relevant_accounts if not used ---
+    # If priority fee calculation is done elsewhere based on actual instruction accounts
+    # def _get_relevant_accounts(self, token_info: TokenInfo) -> list[Pubkey]: ...

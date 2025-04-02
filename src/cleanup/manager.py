@@ -1,12 +1,12 @@
 from solders.pubkey import Pubkey
 from spl.token.instructions import BurnParams, CloseAccountParams, burn, close_account
 
-from config import CLEANUP_FORCE_CLOSE_WITH_BURN
-from core.client import SolanaClient
-from core.priority_fee.manager import PriorityFeeManager
-from core.pubkeys import SystemAddresses
-from core.wallet import Wallet
-from utils.logger import get_logger
+from ..config import CLEANUP_FORCE_CLOSE_WITH_BURN
+from ..core.client import SolanaClient
+from ..core.priority_fee.manager import PriorityFeeManager
+from ..core.pubkeys import SystemAddresses
+from ..core.wallet import Wallet
+from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 

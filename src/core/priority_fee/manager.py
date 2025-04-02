@@ -1,16 +1,14 @@
 from solders.pubkey import Pubkey
 
-from core.client import SolanaClient
-from core.priority_fee.dynamic_fee import DynamicPriorityFee
-from core.priority_fee.fixed_fee import FixedPriorityFee
-from utils.logger import get_logger
+from .dynamic_fee import DynamicPriorityFee
+from .fixed_fee import FixedPriorityFee
+from ..client import SolanaClient
+from ...utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-
 class PriorityFeeManager:
     """Manager for priority fee calculation and validation."""
-
     def __init__(
         self,
         client: SolanaClient,
@@ -38,7 +36,7 @@ class PriorityFeeManager:
         self.extra_fee = extra_fee
         self.hard_cap = hard_cap
 
-        # Initialize plugins
+        # Initialize fee plugins.
         self.dynamic_fee_plugin = DynamicPriorityFee(client)
         self.fixed_fee_plugin = FixedPriorityFee(fixed_fee)
 
@@ -59,16 +57,12 @@ class PriorityFeeManager:
         if base_fee is None:
             return None
 
-        # Apply extra fee (percentage increase)
+        # Apply extra fee as a percentage increase.
         final_fee = int(base_fee * (1 + self.extra_fee))
-
-        # Enforce hard cap
+        # Enforce hard cap.
         if final_fee > self.hard_cap:
-            logger.warning(
-                f"Calculated priority fee {final_fee} exceeds hard cap {self.hard_cap}. Applying hard cap."
-            )
+            logger.warning(f"Calculated priority fee {final_fee} exceeds hard cap {self.hard_cap}. Applying hard cap.")
             final_fee = self.hard_cap
-
         return final_fee
 
     async def _get_base_fee(self, accounts: list[Pubkey] | None = None) -> int | None:
@@ -78,15 +72,10 @@ class PriorityFeeManager:
         Returns:
             Optional[int]: Base fee in microlamports, or None if no fee should be applied.
         """
-        # Prefer dynamic fee if both are enabled
         if self.enable_dynamic_fee:
             dynamic_fee = await self.dynamic_fee_plugin.get_priority_fee(accounts)
             if dynamic_fee is not None:
                 return dynamic_fee
-
-        # Fall back to fixed fee if enabled
         if self.enable_fixed_fee:
             return await self.fixed_fee_plugin.get_priority_fee()
-
-        # No priority fee if both are disabled
         return None

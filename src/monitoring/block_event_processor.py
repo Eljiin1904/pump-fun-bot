@@ -1,7 +1,6 @@
 """
 Event processing for pump.fun tokens.
 """
-
 import base64
 import json
 import struct
@@ -10,8 +9,8 @@ from typing import Any
 from solders.pubkey import Pubkey
 from solders.transaction import VersionedTransaction
 
-from trading.base import TokenInfo
-from utils.logger import get_logger
+from ..trading.base import TokenInfo
+from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 

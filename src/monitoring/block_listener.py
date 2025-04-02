@@ -9,10 +9,10 @@ from collections.abc import Awaitable, Callable
 import websockets
 from solders.pubkey import Pubkey
 
-from monitoring.base_listener import BaseTokenListener
-from monitoring.block_event_processor import PumpEventProcessor
-from trading.base import TokenInfo
-from utils.logger import get_logger
+from .base_listener import BaseTokenListener
+from .block_event_processor import PumpEventProcessor
+from ..trading.base import TokenInfo
+from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 

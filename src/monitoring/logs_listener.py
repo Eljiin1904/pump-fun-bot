@@ -1,7 +1,6 @@
 """
 WebSocket monitoring for pump.fun tokens using logsSubscribe.
 """
-
 import asyncio
 import json
 from collections.abc import Awaitable, Callable
@@ -9,10 +8,10 @@ from collections.abc import Awaitable, Callable
 import websockets
 from solders.pubkey import Pubkey
 
-from monitoring.base_listener import BaseTokenListener
-from monitoring.logs_event_processor import LogsEventProcessor
-from trading.base import TokenInfo
-from utils.logger import get_logger
+from .base_listener import BaseTokenListener
+from .logs_event_processor import LogsEventProcessor
+from ..trading.base import TokenInfo
+from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 

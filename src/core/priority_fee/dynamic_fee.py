@@ -2,9 +2,9 @@ import statistics
 
 from solders.pubkey import Pubkey
 
-from core.client import SolanaClient
-from core.priority_fee import PriorityFeePlugin
-from utils.logger import get_logger
+from . import PriorityFeePlugin
+from ..client import SolanaClient
+from ...utils.logger import get_logger
 
 logger = get_logger(__name__)
 

@@ -1,6 +1,6 @@
-from cleanup.manager import AccountCleanupManager
-from config import CLEANUP_MODE, CLEANUP_WITH_PRIORITY_FEE
-from utils.logger import get_logger
+from .manager import AccountCleanupManager
+from ..config import CLEANUP_MODE, CLEANUP_WITH_PRIORITY_FEE
+from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
