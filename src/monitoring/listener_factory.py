@@ -1,51 +1,47 @@
 # src/monitoring/listener_factory.py
 
-from .base_listener import BaseTokenListener
-from .block_listener import BlockListener  # Assuming this exists
-from .logs_listener import LogsListener
-from ..core.client import SolanaClient  # Import SolanaClient for type hint
-from ..core.pubkeys import PumpAddresses  # Import PumpAddresses
-from ..utils.logger import get_logger
+from typing import Optional
+
+# Use absolute imports assuming factory is in src/monitoring
+try:
+    from .logs_listener import LogsListener
+    # from .block_listener import BlockListener # Uncomment if you implement BlockListener
+    from .base_listener import BaseTokenListener # Import base class for type hint
+    from ..core.client import SolanaClient # Import SolanaClient for type hint
+    from ..core.pubkeys import PumpAddresses # Import for default program ID (though listener handles it)
+    from ..utils.logger import get_logger
+except ImportError as e:
+    print(f"ERROR importing in listener_factory: {e}")
+    # Define dummies if necessary for basic parsing, though functionality breaks
+    SolanaClient = object; LogsListener = object; BlockListener = object; BaseTokenListener = object; PumpAddresses = object; get_logger = lambda x: type('dummy', (object,), {'info': print, 'error': print, 'warning': print})()
 
 logger = get_logger(__name__)
 
 class ListenerFactory:
-    """Factory class to create token listener instances."""
-
     def create_listener(
         self,
         listener_type: str,
         wss_endpoint: str,
-        solana_client: SolanaClient # Pass the client wrapper
-        # Add other necessary parameters if listeners need them (e.g., program_id)
-    ) -> BaseTokenListener:
-        """
-        Creates a token listener instance based on the specified type.
+        client: SolanaClient # Expect the SolanaClient wrapper instance
+        # Optional: program_id_to_monitor could be added later if needed
+        ) -> BaseTokenListener: # Return type hint using base class
+        """Creates a listener instance based on type."""
+        logger.info(f"Creating {listener_type} listener for endpoint: {wss_endpoint}")
 
-        Args:
-            listener_type: The type of listener ('logs' or 'block').
-            wss_endpoint: The WebSocket endpoint URL.
-            solana_client: The SolanaClient wrapper instance.
-            # program_id: The program ID to monitor (e.g., PumpAddresses.PROGRAM)
+        if listener_type.lower() == 'logs':
+            # --- Ensure the CORRECT 'client' object is passed ---
+            # It receives 'client' as an argument and passes it to LogsListener.
+            # LogsListener internally knows which program ID to monitor (PumpAddresses.PROGRAM).
+            return LogsListener(wss_endpoint, client)
+            # --- End Correction ---
 
-        Returns:
-            An instance of a class derived from BaseTokenListener.
+        # elif listener_type.lower() == 'block':
+        #     # Example if BlockListener exists
+        #     if not hasattr(client, 'rpc_endpoint'):
+        #          raise ValueError("BlockListener requires SolanaClient with rpc_endpoint")
+        #     return BlockListener(client.rpc_endpoint, client) # Pass RPC and client
 
-        Raises:
-            ValueError: If an unsupported listener type is provided.
-        """
-        program_id_to_monitor = PumpAddresses.PROGRAM # Define the program to monitor
-
-        if listener_type.lower() == "logs":
-            logger.info(f"Creating LogsListener for endpoint: {wss_endpoint}")
-            # Pass necessary arguments to LogsListener constructor
-            return LogsListener(wss_endpoint, program_id_to_monitor)
-        elif listener_type.lower() == "block":
-            logger.info(f"Creating BlockListener for endpoint: {wss_endpoint}")
-            # Pass necessary arguments to BlockListener constructor
-            # Assuming BlockListener constructor takes wss_endpoint and program_id
-            return BlockListener(wss_endpoint, program_id_to_monitor) # Adjust constructor if needed
         else:
-            error_msg = f"Unsupported listener type: '{listener_type}'. Choose 'logs' or 'block'."
-            logger.error(error_msg)
-            raise ValueError(error_msg)
+            # Log error before raising for clarity
+            logger.error(f"Attempted to create unsupported listener type: {listener_type}")
+            raise ValueError(f"Unsupported listener type: {listener_type}")

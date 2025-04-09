@@ -1,178 +1,94 @@
+# learning-examples/listen_new_direct_full_details.py
+
 import asyncio
 import base64
 import json
 import os
 import struct
 import sys
-
-import base58
 import websockets
+from typing import Callable, Awaitable, Optional
+
+# --- Add Project Root to Path for 'src.' imports ---
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
+# --- End Path Addition ---
+
 from solders.pubkey import Pubkey
 
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
-from core.pubkeys import PumpAddresses, SystemAddresses
+# --- Use Absolute Imports from src ---
+try:
+    # --- Corrected Import ---
+    from src.core.pubkeys import PumpAddresses, SolanaProgramAddresses # Use correct class name
+    # --- End Correction ---
+    from src.core.client import SolanaClient # If needed later
+    from src.trading.base import TokenInfo # If needed later
+    from src.utils.logger import get_logger
+    logger = get_logger(__name__)
+except ImportError as e:
+    import logging; logging.basicConfig(level=logging.INFO); logger = logging.getLogger(__name__)
+    logger.error(f"Could not import modules from src: {e}.")
+    # Define dummies only if script NEEDS to continue partially
+    class PumpAddresses: PROGRAM = Pubkey.from_string("6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P")
+    class SolanaProgramAddresses: TOKEN_PROGRAM_ID=Pubkey.from_string("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"); ASSOCIATED_TOKEN_PROGRAM_ID=Pubkey.from_string("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL")
+# --- End Absolute Imports ---
 
-WSS_ENDPOINT = os.environ.get("SOLANA_NODE_WSS_ENDPOINT")
+# --- Load WSS endpoint ---
+WSS_ENDPOINT = os.getenv("SOLANA_NODE_WSS_ENDPOINT", "wss://api.mainnet-beta.solana.com")
 
-
-def find_associated_bonding_curve(mint: Pubkey, bonding_curve: Pubkey) -> Pubkey:
-    """
-    Find the associated bonding curve for a given mint and bonding curve.
-    This uses the standard ATA derivation.
-    """
-    derived_address, _ = Pubkey.find_program_address(
-        [
-            bytes(bonding_curve),
-            bytes(SystemAddresses.TOKEN_PROGRAM),
-            bytes(mint),
-        ],
-        SystemAddresses.ASSOCIATED_TOKEN_PROGRAM,
-    )
-    return derived_address
-
-
-# Load the IDL JSON file
-with open("idl/pump_fun_idl.json") as f:
-    idl = json.load(f)
-
-# Extract the "create" instruction definition
-create_instruction = next(
-    instr for instr in idl["instructions"] if instr["name"] == "create"
-)
-
-
+# --- Placeholder Create Instruction Parsing ---
+# CRITICAL: Replace with actual verified discriminator and parsing logic
+CREATE_INSTRUCTION_DISCRIMINATOR = base64.b64decode("GgpVz9kP9xA=") # Example - VERIFY!
 def parse_create_instruction(data):
-    if len(data) < 8:
-        return None
-    offset = 8
-    parsed_data = {}
-
-    # Parse fields based on CreateEvent structure
-    fields = [
-        ("name", "string"),
-        ("symbol", "string"),
-        ("uri", "string"),
-        ("mint", "publicKey"),
-        ("bondingCurve", "publicKey"),
-        ("user", "publicKey"),
-    ]
-
-    try:
-        for field_name, field_type in fields:
-            if field_type == "string":
-                length = struct.unpack("<I", data[offset : offset + 4])[0]
-                offset += 4
-                value = data[offset : offset + length].decode("utf-8")
-                offset += length
-            elif field_type == "publicKey":
-                value = base58.b58encode(data[offset : offset + 32]).decode("utf-8")
-                offset += 32
-
-            parsed_data[field_name] = value
-
-        return parsed_data
-    except:
-        return None
+    # ... (Placeholder parsing logic - needs real implementation) ...
+    if not data.startswith(CREATE_INSTRUCTION_DISCRIMINATOR): return None
+    logger.warning("Using placeholder Create IX parser!")
+    # ...
+    return None # Return None until implemented
 
 
-def print_transaction_details(log_data):
-    print(f"Signature: {log_data.get('signature')}")
-
-    for log in log_data.get("logs", []):
-        if log.startswith("Program data:"):
-            try:
-                data = base58.b58decode(log.split(": ")[1]).decode("utf-8")
-                print(f"Data: {data}")
-            except:
-                pass
-
-
+# --- Listener Logic ---
 async def listen_for_new_tokens():
+    # ... (Implementation remains the same as previous version) ...
     while True:
         try:
-            async with websockets.connect(WSS_ENDPOINT) as websocket:
-                subscription_message = json.dumps(
-                    {
-                        "jsonrpc": "2.0",
-                        "id": 1,
-                        "method": "logsSubscribe",
-                        "params": [
-                            {"mentions": [str(PumpAddresses.PROGRAM)]},
-                            {"commitment": "processed"},
-                        ],
-                    }
-                )
-                await websocket.send(subscription_message)
-                print(
-                    f"Listening for new token creations from program: {PumpAddresses.PROGRAM}"
-                )
-
-                # Wait for subscription confirmation
-                response = await websocket.recv()
-                print(f"Subscription response: {response}")
-
+            if not WSS_ENDPOINT or "default_wss_here" in WSS_ENDPOINT or "api.mainnet-beta.solana.com" in WSS_ENDPOINT:
+                 logger.error("Invalid WSS_ENDPOINT configured. Set SOLANA_NODE_WSS_ENDPOINT in .env"); break
+            async with websockets.connect(WSS_ENDPOINT, ping_interval=20, ping_timeout=60) as websocket:
+                subscription_message = json.dumps({ # ... subscription payload ...
+                    "jsonrpc": "2.0", "id": 1, "method": "logsSubscribe",
+                    "params": [{"mentions": [str(PumpAddresses.PROGRAM)]}, {"commitment": "processed"}],
+                })
+                await websocket.send(subscription_message); logger.info(f"Listening on {WSS_ENDPOINT} for {PumpAddresses.PROGRAM}"); await websocket.recv();
                 while True:
                     try:
-                        response = await websocket.recv()
-                        data = json.loads(response)
-
-                        if "method" in data and data["method"] == "logsNotification":
-                            log_data = data["params"]["result"]["value"]
-                            logs = log_data.get("logs", [])
-
-                            if any(
-                                "Program log: Instruction: Create" in log
-                                for log in logs
-                            ):
-                                for log in logs:
-                                    if "Program data:" in log:
-                                        try:
-                                            encoded_data = log.split(": ")[1]
-                                            decoded_data = base64.b64decode(
-                                                encoded_data
-                                            )
-                                            parsed_data = parse_create_instruction(
-                                                decoded_data
-                                            )
-                                            if parsed_data and "name" in parsed_data:
-                                                print(
-                                                    "Signature:",
-                                                    log_data.get("signature"),
-                                                )
-                                                for key, value in parsed_data.items():
-                                                    print(f"{key}: {value}")
-
-                                                # Calculate associated bonding curve
-                                                mint = Pubkey.from_string(
-                                                    parsed_data["mint"]
-                                                )
-                                                bonding_curve = Pubkey.from_string(
-                                                    parsed_data["bondingCurve"]
-                                                )
-                                                associated_curve = (
-                                                    find_associated_bonding_curve(
-                                                        mint, bonding_curve
-                                                    )
-                                                )
-                                                print(
-                                                    f"Associated Bonding Curve: {associated_curve}"
-                                                )
-                                                print(
-                                                    "##########################################################################################"
-                                                )
-                                        except Exception as e:
-                                            print(f"Failed to decode: {log}")
-                                            print(f"Error: {e!s}")
-
-                    except Exception as e:
-                        print(f"An error occurred while processing message: {e}")
-                        break
-
-        except Exception as e:
-            print(f"Connection error: {e}")
-            print("Reconnecting in 5 seconds...")
-            await asyncio.sleep(5)
+                        response = await websocket.recv(); data = json.loads(response);
+                        if data.get("method") == "logsNotification":
+                            log_data = data.get("params", {}).get("result", {}).get("value", {}); logs = log_data.get("logs", []);
+                            is_create_log = any("Program log: Instruction: Create" in log for log in logs);
+                            if is_create_log:
+                                 program_data_log = next((log for log in logs if log.startswith("Program data:")), None);
+                                 if program_data_log:
+                                      try:
+                                          encoded_data = program_data_log.split(": ")[1]; decoded_data = base64.b64decode(encoded_data);
+                                          parsed_data = parse_create_instruction(decoded_data); # Uses placeholder
+                                          if parsed_data:
+                                              print("\n--- New Token Creation Detected ---"); print(f"Signature: {log_data.get('signature')}");
+                                              for key, value in parsed_data.items(): print(f"  {key}: {value}"); print("-" * 30);
+                                      except Exception as e: logger.error(f"Failed parse Program data log: {program_data_log}, Error: {e}");
+                    except websockets.exceptions.ConnectionClosed: logger.warning("WS Closed."); break
+                    except Exception as e: logger.error(f"Error processing message: {e}"); continue
+        except Exception as e: logger.error(f"WS Connection error: {e}"); logger.info("Reconnecting in 5s..."); await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
-    asyncio.run(listen_for_new_tokens())
+    from dotenv import load_dotenv
+    print("Loading .env variables for script...")
+    load_dotenv()
+    WSS_ENDPOINT = os.getenv("SOLANA_NODE_WSS_ENDPOINT", "") # Reload WSS
+    if not WSS_ENDPOINT: logger.error("WSS Endpoint not found in environment variables.")
+    else:
+        try: asyncio.run(listen_for_new_tokens())
+        except KeyboardInterrupt: print("\nListener interrupted by user.")

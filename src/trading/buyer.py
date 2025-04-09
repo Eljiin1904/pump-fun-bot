@@ -1,189 +1,141 @@
 # src/trading/buyer.py
 
 import asyncio
-import struct
-from typing import Final, Optional
+from typing import Optional
 
-# V V V FIX: Add Commitment, Confirmed imports V V V
-from solana.rpc.commitment import Confirmed
-from solders.account import Account
-from solders.instruction import AccountMeta, Instruction
-from solders.pubkey import Pubkey
-# Import necessary types
-from solders.signature import Signature
-from spl.token.instructions import create_associated_token_account
+# --- Solana/Solders Imports ---
+from solders.compute_budget import set_compute_unit_price, set_compute_unit_limit
+from solders.transaction_status import TransactionConfirmationStatus
+from solders.signature import Signature # Keep this import
 
-from .base import TokenInfo, Trader, TradeResult
 from ..core.client import SolanaClient
-# V V V FIX: Add BondingCurveState import V V V
-from ..core.curve import BondingCurveManager, BondingCurveState
-from ..core.priority_fee.manager import PriorityFeeManager
-from ..core.pubkeys import (
-    LAMPORTS_PER_SOL,
-    TOKEN_DECIMALS,
-    PumpAddresses,
-    SystemAddresses,
+# --- Import Constants FROM curve.py ---
+from ..core.curve import (
+    BondingCurveManager,
+    BondingCurveState,
+    LAMPORTS_PER_SOL,          # Import constant
+    DEFAULT_TOKEN_DECIMALS     # Import constant
 )
+# --- End Import ---
+from ..core.priority_fee.manager import PriorityFeeManager # Verify method name get_fee()
 from ..core.wallet import Wallet
+from ..core.transactions import build_and_send_transaction, TransactionResult
+from ..core.instruction_builder import InstructionBuilder
+from ..trading.base import TokenInfo, TradeResult
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
+# LAMPORTS_PER_SOL = 1_000_000_000 # Defined in curve.py now
 
-EXPECTED_DISCRIMINATOR: Final[bytes] = struct.pack("<Q", 16927863322537952870)
+class TokenBuyer:
+    """Handles the token buying process on the bonding curve."""
 
-class TokenBuyer(Trader):
-    """Handles buying tokens on pump.fun."""
-
-    # --- Update __init__ signature slightly ---
     def __init__(
         self,
         client: SolanaClient,
         wallet: Wallet,
         curve_manager: BondingCurveManager,
         priority_fee_manager: PriorityFeeManager,
-        buy_amount: float, # Renamed from amount for clarity
-        buy_slippage: float, # Renamed from slippage
-        max_tx_retries: int, # Renamed from max_buy_retries
-        confirm_timeout: int = 60,
+        amount_sol: float,
+        slippage_decimal: float, # Expect decimal e.g. 0.25
+        max_retries: int,
+        confirm_timeout: int,
     ):
-        """Initialize token buyer."""
         self.client = client
         self.wallet = wallet
         self.curve_manager = curve_manager
         self.priority_fee_manager = priority_fee_manager
-        self.buy_amount = buy_amount
-        self.buy_slippage_bps = int(buy_slippage * 10000)
-        self.max_tx_retries = max_tx_retries
+        self.amount_sol = amount_sol
+        # Use imported constant
+        self.amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
+        self.slippage_decimal = slippage_decimal
+        self.max_retries = max_retries
         self.confirm_timeout = confirm_timeout
-        logger.info(f"TokenBuyer initialized with SOL amount: {self.buy_amount}, Slippage: {buy_slippage*100:.2f}% ({self.buy_slippage_bps} bps)")
+        logger.info(f"TokenBuyer initialized with SOL amount: {self.amount_sol:.6f}, Slippage: {self.slippage_decimal * 100:.2f}%")
 
-    # --- execute method (includes debug block and liquidity capture) ---
-    async def execute(self, token_info: TokenInfo, *args, **kwargs) -> TradeResult:
-        """Execute buy operation for a given token."""
-        buy_tx_sig: Optional[str] = None
-        initial_sol_liquidity: Optional[int] = None
-        curve_state: Optional[BondingCurveState] = None
-        final_balance_raw: Optional[int] = None
 
-        try:
-            # 1. Fetch Curve State & Calculate Buy Parameters
-            logger.debug(f"Fetching curve state for {token_info.symbol} ({token_info.bonding_curve})")
-            curve_state = await self.curve_manager.get_curve_state(token_info.bonding_curve)
-            if not curve_state:
-                return TradeResult(success=False, error_message="Failed to fetch bonding curve state.")
+    async def execute(self, token_info: TokenInfo) -> TradeResult:
+        """Executes the buy transaction for the specified token."""
+        retry_count = 0
+        error_message = "Max retries reached"
+        initial_sol_reserves: Optional[int] = None
 
-            # Capture initial liquidity
-            if hasattr(curve_state, 'virtual_sol_reserves'):
-                initial_sol_liquidity = curve_state.virtual_sol_reserves
-                logger.debug(f"Captured initial SOL liquidity: {initial_sol_liquidity} lamports")
-            else:
-                 logger.warning("Could not find virtual_sol_reserves on BondingCurveState.")
+        # --- Get dynamic addresses ---
+        user_pubkey = self.wallet.pubkey
+        mint_pubkey = token_info.mint
+        bonding_curve_pubkey = token_info.bonding_curve
+        curve_details = await self.curve_manager.get_bonding_curve_details(bonding_curve_pubkey)
+        if not curve_details:
+             logger.error(f"BUYER: Failed get curve details {mint_pubkey}.")
+             return TradeResult(success=False, error_message="Failed get curve details")
+        curve_state_for_check, associated_bonding_curve_pubkey = curve_details
+        user_token_account = Wallet.get_associated_token_address(user_pubkey, mint_pubkey)
+        # --- End Get ---
 
-            # Calculations
-            sol_amount_lamports = int(self.buy_amount * LAMPORTS_PER_SOL)
-            if sol_amount_lamports <= 0: return TradeResult(success=False, error_message="Invalid SOL buy amount.")
-            token_price_sol = curve_state.calculate_price()
-            if token_price_sol <= 0: return TradeResult(success=False, error_message="Invalid token price calculated.")
+        while retry_count < self.max_retries:
+            retry_count += 1
+            logger.info(f"Buy attempt {retry_count}/{self.max_retries} for {token_info.symbol} ({mint_pubkey})")
 
-            expected_token_output = self.buy_amount / token_price_sol
-            min_token_output_raw = int((expected_token_output * (1 - self.buy_slippage_bps / 10000.0)) * (10**TOKEN_DECIMALS))
-            if min_token_output_raw <= 0: logger.warning(f"Calculated minimum token output zero/negative ({min_token_output_raw} raw).")
-            max_sol_cost_lamports = sol_amount_lamports
+            try:
+                # 1. Get current curve state
+                curve_state: Optional[BondingCurveState] = await self.curve_manager.get_curve_state(bonding_curve_pubkey)
+                if not curve_state:
+                    error_message = "Failed fetch bonding curve state."; logger.warning(f"{error_message} Retry..."); await asyncio.sleep(2); continue
 
-            logger.info(f"Attempting buy: ~{expected_token_output:.6f} {token_info.symbol}, min_out={min_token_output_raw} raw, amount={self.buy_amount:.8f} SOL, max_cost={max_sol_cost_lamports/LAMPORTS_PER_SOL:.8f} SOL")
+                if retry_count == 1 and curve_state_for_check: initial_sol_reserves = curve_state_for_check.virtual_sol_reserves
+                else: initial_sol_reserves = curve_state.virtual_sol_reserves
 
-            # 2. Ensure ATA Exists
-            associated_token_account = Wallet.get_associated_token_address(token_info.mint, self.wallet.pubkey)
-            ata_exists = await self._ensure_associated_token_account(token_info.mint, associated_token_account)
-            if not ata_exists: return TradeResult(success=False, error_message="Failed ensure ATA exists.")
-
-            # 3. Send Buy Transaction
-            buy_tx_sig = await self._send_buy_transaction(token_info, associated_token_account, max_sol_cost_lamports, min_token_output_raw)
-            if not buy_tx_sig: return TradeResult(success=False, error_message="Failed send buy tx.", initial_sol_liquidity=initial_sol_liquidity)
-
-            # 4. Confirm Buy Transaction
-            success = await self.client.confirm_transaction(buy_tx_sig, commitment=Confirmed, max_timeout_seconds=self.confirm_timeout)
-
-            # 5. Process Result & Debug Logging
-            if success:
-                logger.info(f"Buy transaction confirmed: {buy_tx_sig}")
-                # --- DEBUG BLOCK ---
+                # 2. Calculate amounts
                 try:
-                    await asyncio.sleep(2.0)
-                    logger.debug(f"Fetching detailed tx info for {buy_tx_sig}...")
-                    sig_obj = Signature.from_string(buy_tx_sig)
-                    actual_client = await self.client.get_client()
-                    tx_info_resp = await actual_client.get_transaction(sig_obj, max_supported_transaction_version=0, commitment=Confirmed)
+                     est_tokens_out = curve_state.calculate_tokens_out_for_sol(self.amount_lamports)
+                     min_tokens_out = int(est_tokens_out * (1 - self.slippage_decimal))
+                     max_sol_cost_lamports = self.amount_lamports
+                     logger.debug(f"Est tokens out: {est_tokens_out}, Min tokens out: {min_tokens_out}, Max SOL cost: {max_sol_cost_lamports}")
+                     if min_tokens_out <= 0: error_message = f"Min tokens out <= 0 ({min_tokens_out})."; logger.error(error_message); break
+                except (AttributeError, ValueError, TypeError) as calc_e:
+                     error_message = f"Error buy calc: {calc_e}"; logger.error(f"{error_message}. Retry..."); await asyncio.sleep(2); continue
 
-                    if tx_info_resp and tx_info_resp.value:
-                        tx_value = tx_info_resp.value
-                        if tx_value.transaction and tx_value.transaction.meta:
-                            meta = tx_value.transaction.meta
-                            logger.info(f"--- Tx Meta Analysis {buy_tx_sig} ---")
-                            logger.info(f"  Status (err): {meta.err}")
-                            if meta.err: logger.error(f"  !!! Tx Error: {meta.err} !!!"); logger.error(f"  Logs: {meta.log_messages}")
-                            if meta.post_token_balances:
-                                found_balance = False
-                                for balance in meta.post_token_balances:
-                                    if balance.owner == self.wallet.pubkey and balance.mint == token_info.mint:
-                                        raw_amount = getattr(balance.ui_token_amount, 'amount', 'N/A')
-                                        logger.info(f"  >>> User ATA Post-Balance: {raw_amount} raw")
-                                        final_balance_raw = int(raw_amount) if raw_amount != 'N/A' else None
-                                        found_balance = True; break
-                                if not found_balance: logger.warning(f"  >>> User ATA balance not found post-tx.")
-                            else: logger.info("  >>> No post_token_balances found.")
-                            logger.info(f"--- End Meta Analysis ---")
-                            if meta.err: return TradeResult(success=False, error_message=f"Buy swap failed in confirmed tx: {meta.err}", tx_signature=buy_tx_sig, initial_sol_liquidity=initial_sol_liquidity)
-                            if final_balance_raw is not None and final_balance_raw <= 0:
-                                logger.error(f"!!! Buy confirmed but ZERO token balance ({final_balance_raw} raw). Tx: {buy_tx_sig}")
-                                return TradeResult(success=False, error_message="Buy resulted in zero token balance.", tx_signature=buy_tx_sig, initial_sol_liquidity=initial_sol_liquidity)
-                        else: logger.warning("Could not find tx.meta details.")
-                    else: logger.warning("Could not fetch tx info.")
-                except Exception as e: logger.error(f"Error during post-buy tx detail fetch: {e}", exc_info=True)
-                # --- END DEBUG BLOCK ---
-                return TradeResult(success=True, tx_signature=buy_tx_sig, amount=expected_token_output, price=token_price_sol, final_token_balance_raw=final_balance_raw, initial_sol_liquidity=initial_sol_liquidity)
-            else: # Confirmation failed
-                logger.error(f"Buy transaction confirmation failed: {buy_tx_sig}")
-                return TradeResult(success=False, error_message="Tx confirmation failed", tx_signature=buy_tx_sig, initial_sol_liquidity=initial_sol_liquidity)
-        except Exception as e:
-            logger.error(f"Unhandled exception during buy for {token_info.symbol}: {e}", exc_info=True)
-            return TradeResult(success=False, error_message=str(e), tx_signature=buy_tx_sig, initial_sol_liquidity=initial_sol_liquidity)
+                # 3. Get priority fees
+                try: compute_unit_price_micro_lamports = await self.priority_fee_manager.get_fee() # Use assumed name 'get_fee'
+                except AttributeError: logger.error("FATAL: PriorityFeeManager missing get_fee()!"); raise
+                except Exception as fee_e: logger.error(f"Error getting priority fee: {fee_e}. Using 0."); compute_unit_price_micro_lamports = 0
+                compute_unit_limit = 200_000 # Placeholder - ADJUST
 
+                # 4. Build instructions
+                instructions = [ set_compute_unit_limit(compute_unit_limit), set_compute_unit_price(compute_unit_price_micro_lamports) ]
+                ata_instructions = InstructionBuilder.get_create_ata_instruction(payer_pubkey=user_pubkey, owner=user_pubkey, mint=mint_pubkey)
+                instructions.extend(ata_instructions)
+                buy_instruction = InstructionBuilder.get_pump_buy_instruction(
+                    user_pubkey=user_pubkey, mint_pubkey=mint_pubkey, bonding_curve_pubkey=bonding_curve_pubkey,
+                    associated_bonding_curve_pubkey=associated_bonding_curve_pubkey, user_token_account=user_token_account,
+                    amount_lamports=max_sol_cost_lamports, min_token_output=min_tokens_out )
+                if buy_instruction is None: error_message = "Failed build pump buy ix."; logger.error(error_message); break
+                instructions.append(buy_instruction)
 
-    async def _ensure_associated_token_account(self, mint: Pubkey, associated_token_account: Pubkey) -> bool:
-        """Ensure associated token account exists, else create it."""
-        try:
-            account_info: Optional[Account] = await self.client.get_account_info(associated_token_account, commitment=Confirmed)
-            if account_info is None:
-                logger.info(f"Creating ATA {associated_token_account} for mint {mint}...")
-                create_ata_ix = create_associated_token_account(payer=self.wallet.pubkey, owner=self.wallet.pubkey, mint=mint)
-                priority_fee = await self.priority_fee_manager.calculate_priority_fee([mint, self.wallet.pubkey, SystemAddresses.PROGRAM, SystemAddresses.TOKEN_PROGRAM, SystemAddresses.ASSOCIATED_TOKEN_PROGRAM])
-                tx_sig = await self.client.build_and_send_transaction([create_ata_ix], self.wallet.keypair, skip_preflight=True, max_retries=self.max_tx_retries, priority_fee=priority_fee, compute_unit_limit=200_000)
-                if not tx_sig: return False
-                confirmed = await self.client.confirm_transaction(tx_sig, commitment=Confirmed, max_timeout_seconds=self.confirm_timeout)
-                if confirmed: logger.info(f"ATA created: {associated_token_account}"); return True
-                else: logger.error(f"Failed confirm ATA creation tx: {tx_sig}"); return False
-            else: logger.info(f"ATA already exists: {associated_token_account}"); return True
-        except Exception as e: logger.error(f"Failed check/creation of ATA {associated_token_account}: {e}", exc_info=True); return False
+                # 5. Build and send transaction
+                tx_result: TransactionResult = await build_and_send_transaction(
+                    client=self.client, payer=self.wallet.payer, instructions=instructions, label=f"Buy_{token_info.symbol[:5]}" )
 
+                # 6. Process result
+                if tx_result.success and tx_result.signature:
+                    logger.info(f"Buy tx sent: {tx_result.signature}. Confirming...")
+                    try: signature_obj = Signature.from_string(tx_result.signature)
+                    except ValueError: logger.error(f"Invalid sig format: {tx_result.signature}"); error_message = "Invalid sig format"; break
+                    confirmation_status = await self.client.confirm_transaction(signature_obj, timeout_secs=self.confirm_timeout)
 
-    async def _send_buy_transaction(self, token_info: TokenInfo, associated_token_account: Pubkey, max_sol_cost_lamports: int, min_token_output_raw: int) -> Optional[str]:
-        """Send the actual pump.fun buy transaction."""
-        try:
-            accounts = [
-                AccountMeta(PumpAddresses.GLOBAL, False, False), AccountMeta(PumpAddresses.FEE, False, True),
-                AccountMeta(token_info.mint, False, False), AccountMeta(token_info.bonding_curve, False, True),
-                AccountMeta(token_info.associated_bonding_curve, False, True), AccountMeta(associated_token_account, False, True),
-                AccountMeta(self.wallet.pubkey, True, True), AccountMeta(SystemAddresses.PROGRAM, False, False),
-                AccountMeta(SystemAddresses.TOKEN_PROGRAM, False, False), AccountMeta(SystemAddresses.RENT, False, False),
-                AccountMeta(PumpAddresses.EVENT_AUTHORITY, False, False), AccountMeta(PumpAddresses.PROGRAM, False, False),
-            ]
-            data = (EXPECTED_DISCRIMINATOR + struct.pack("<Q", min_token_output_raw) + struct.pack("<Q", max_sol_cost_lamports))
-            logger.debug(f"Buy ix data: min_tokens={min_token_output_raw}, max_sol={max_sol_cost_lamports}")
-            buy_ix = Instruction(PumpAddresses.PROGRAM, data, accounts)
-            priority_fee = await self.priority_fee_manager.calculate_priority_fee([acc.pubkey for acc in accounts])
-            tx_sig = await self.client.build_and_send_transaction([buy_ix], self.wallet.keypair, skip_preflight=True, max_retries=self.max_tx_retries, priority_fee=priority_fee, compute_unit_limit=600_000)
-            return tx_sig
-        except Exception as e:
-            logger.error(f"Failed build/send buy tx for {token_info.symbol}: {e}", exc_info=True)
-            return None
+                    if confirmation_status == TransactionConfirmationStatus.Confirmed or confirmation_status == TransactionConfirmationStatus.Finalized:
+                         logger.info(f"Buy tx CONFIRMED: {tx_result.signature}")
+                         token_decimals = DEFAULT_TOKEN_DECIMALS # Use imported constant
+                         amount_tokens_bought = est_tokens_out / (10**token_decimals) if est_tokens_out > 0 else 0.0
+                         buy_price_sol_per_token = self.amount_sol / amount_tokens_bought if amount_tokens_bought > 0 else 0.0
+                         return TradeResult( success=True, tx_signature=tx_result.signature, price=buy_price_sol_per_token, amount=amount_tokens_bought, initial_sol_liquidity=initial_sol_reserves )
+                    else: status_str = str(confirmation_status) if confirmation_status else "Unknown/Timeout"; error_message = f"Buy tx {tx_result.signature} confirm failed. Status: {status_str}"; logger.warning(error_message)
+                elif tx_result.error_type: error_message = f"Buy tx failed ({tx_result.error_type}): {tx_result.error_message or 'No details'}"; logger.warning(f"{error_message}. Retry..."); await asyncio.sleep(3)
+                else: error_message = "Buy tx send failed unknown error."; logger.error(error_message); await asyncio.sleep(3)
+
+            except Exception as e:
+                error_message = f"Unexpected error buy attempt {retry_count}: {e}"; logger.error(error_message, exc_info=True); await asyncio.sleep(5)
+
+        # Loop finished without success
+        logger.error(f"Failed buy {token_info.symbol} after {self.max_retries} attempts: {error_message}")
+        return TradeResult( success=False, error_message=error_message, initial_sol_liquidity=initial_sol_reserves )

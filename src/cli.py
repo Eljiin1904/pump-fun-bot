@@ -1,225 +1,197 @@
 # src/cli.py
 
 import argparse
-import asyncio
 import importlib
 import os
 import sys
+import asyncio
+# --- Load .env *FIRST* ---
+from dotenv import load_dotenv
+print("Attempting to load environment variables...")
+load_dotenv()
+print(".env variables loaded (if file exists).")
+# --- End Load .env ---
 
-# --- Add project root and src to path more robustly ---
-# Assuming cli.py is in the 'src' directory
-project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-src_path = os.path.dirname(os.path.abspath(__file__)) # This is 'src'
+# Add src directory to Python path
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir)
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
-# --- End Path Setup -- -
+    print(f"Added project root to sys.path: {project_root}")
 
-from dotenv import load_dotenv
-load_dotenv()
-print("Attempting to load environment variables...") # Keep for startup feedback
+# --- Now import project modules ---
+from typing import Optional # Import Optional for type hints
+from src.core.client import SolanaClient
+from solana.rpc.async_api import AsyncClient as SolanaPyAsyncClient
+from src.core.wallet import Wallet
+from src.core.priority_fee.manager import PriorityFeeManager
+from src.trading.trader import PumpTrader
+from src.utils.logger import get_logger
 
-# Setup logging AFTER path adjustments and dotenv
-from src.utils.logger import get_logger, setup_file_logging # Use absolute import from src
-# Ensure this path is correct relative to where you run the bot
-setup_file_logging("pump_trading.log")
 logger = get_logger(__name__)
 
-# --- Core Imports ---
-# Import necessary modules using absolute paths from src
-from src.trading.trader import PumpTrader
-from src.core.client import SolanaClient # Needed for async with block
-from src.core.wallet import Wallet
-# Removed unused ListenerFactory import
+# --- Check Env Vars ---
+rpc_check = os.getenv("SOLANA_NODE_RPC_ENDPOINT"); wss_check = os.getenv("SOLANA_NODE_WSS_ENDPOINT"); key_check = os.getenv("SOLANA_PRIVATE_KEY"); bird_check = os.getenv("BIRDEYE_API_KEY");
+logger.debug(f"Post-load env check: RPC={rpc_check is not None}, WSS={wss_check is not None}, PRIV_KEY={key_check is not None}, BIRD={bird_check is not None}")
 
-# --- Function to load config dynamically ---
-def load_config(config_module_path='src.config'):
-    """Dynamically loads configuration variables from a given module path."""
-    import_path = None
-    absolute_file_path = None
+
+def load_config(config_path: str):
+    """Loads configuration from a Python module path."""
+    logger.info(f"Attempting to load configuration from: {config_path}")
+    if config_path.endswith(".py"): config_path = config_path[:-3]
+    import_path = config_path.replace(os.path.sep, '.')
+    normalized_path = os.path.normpath(config_path)
+    if not import_path.startswith('src.') and 'src' in config_path and normalized_path.startswith('src'):
+         import_path = normalized_path.replace(os.path.sep, '.')
+         logger.debug(f"Adjusted import path to: {import_path}")
+    logger.info(f"Derived import path: {import_path}")
     try:
-        # Clean the path for importlib (removes .py, uses dots)
-        import_path = config_module_path.replace('/', '.').replace('\\', '.').removesuffix('.py')
-
-        # Convert import path back to file path for checking existence
-        # Assumes config files are in 'src/' relative to project_root
-        relative_file_path = import_path.replace('.', os.sep) + '.py'
-        absolute_file_path = os.path.join(project_root, relative_file_path)
-
-        logger.debug(f"Checking for config file at: {absolute_file_path}")
-        if not os.path.exists(absolute_file_path):
-            # Try checking relative to 'src/' directly if project_root logic failed
-            alt_path = os.path.join(src_path, os.path.basename(absolute_file_path))
-            if os.path.exists(alt_path):
-                logger.warning(f"Config found at {alt_path}, expected {absolute_file_path}. Adjusting...")
-                absolute_file_path = alt_path
-                # Adjust import path if necessary? Usually importlib handles src. prefix well if src's parent is in path
-            else:
-                raise FileNotFoundError(f"Config file not found. Checked: {absolute_file_path} and {alt_path}. Ensure it exists directly inside the 'src/' directory.")
-
         config_module = importlib.import_module(import_path)
-        logger.info(f"Successfully loaded configuration from: {import_path}")
-        return config_module
-
-    except (ModuleNotFoundError, FileNotFoundError) as e:
-        logger.error(f"Config load error (path='{config_module_path}' -> import='{import_path or 'N/A'}' -> file='{absolute_file_path or 'N/A'}'): {e}. Ensure the file exists in 'src/' and path is like 'src.config_name'.")
-        sys.exit(1)
-    except Exception as e:
-        logger.error(f"Unexpected error loading configuration from {config_module_path}: {e}", exc_info=True)
-        sys.exit(1)
-
-# --- parse_args function ---
-def parse_args(default_config_module) -> argparse.Namespace:
-    """Parse command line arguments, using defaults from loaded config."""
-    parser = argparse.ArgumentParser(description="Trade tokens on pump.fun.", formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    # Define arguments
-    parser.add_argument("--config", default="src.config", help="Path to config module (e.g., src.config_yolo_marry)")
-    parser.add_argument("--yolo", action="store_true", help="Run continuously")
-    parser.add_argument("--marry", action="store_true", help="Buy only, no selling")
-    parser.add_argument("--match", help="Filter token name/symbol")
-    parser.add_argument("--bro", help="Filter by creator address")
-    parser.add_argument("--amount", type=float, default=argparse.SUPPRESS, help="SOL amount per buy (override)")
-    parser.add_argument("--buy-slippage", type=float, default=argparse.SUPPRESS, help="Buy slippage (override)")
-    parser.add_argument("--sell-slippage", type=float, default=argparse.SUPPRESS, help="Sell slippage (override)")
-    parser.add_argument("--rug-check-creator", action="store_true", help="Enable creator hold check")
-    parser.add_argument("--rug-max-creator-hold-pct", type=float, default=argparse.SUPPRESS, help="Max creator hold %% (override)")
-    parser.add_argument("--rug-check-price-drop", action="store_true", help="Enable post-buy price drop check")
-    parser.add_argument("--rug-price-drop-pct", type=float, default=argparse.SUPPRESS, help="Price drop %% threshold (override)")
-    parser.add_argument("--rug-check-liquidity-drop", action="store_true", help="Enable post-buy liquidity drop check")
-    parser.add_argument("--rug-liquidity-drop-pct", type=float, default=argparse.SUPPRESS, help="Liquidity drop %% threshold (override)")
-
-    # Set defaults safely using getattr from the loaded config module
-    parser.set_defaults(
-         amount=getattr(default_config_module, 'BUY_AMOUNT', 0.000001),
-         buy_slippage=getattr(default_config_module, 'BUY_SLIPPAGE', 0.25),
-         sell_slippage=getattr(default_config_module, 'SELL_SLIPPAGE', 0.25),
-         rug_max_creator_hold_pct=getattr(default_config_module, 'RUG_MAX_CREATOR_HOLD_PERCENT', 0.25),
-         rug_price_drop_pct=getattr(default_config_module, 'SELL_PRICE_DROP_THRESHOLD', 0.5),
-         rug_liquidity_drop_pct=getattr(default_config_module, 'SELL_LIQUIDITY_DROP_THRESHOLD', 0.6),
-    )
-    final_args = parser.parse_args()
-    final_args.loaded_config = default_config_module # Attach module for easy access
-    return final_args
+        logger.info(f"Successfully loaded configuration module: {import_path}")
+        required_vars = ['SOLANA_NODE_RPC_ENDPOINT', 'SOLANA_NODE_WSS_ENDPOINT', 'SOLANA_PRIVATE_KEY']
+        config = {}
+        missing_vars = []
+        for var in required_vars: value = getattr(config_module, var, os.getenv(var)); config[var.lower()] = value;
+        optional_vars_defaults = {
+             'BUY_AMOUNT': 0.01, 'BUY_SLIPPAGE_BPS': 2500, 'SELL_SLIPPAGE_BPS': 2500,
+             'SELL_PROFIT_THRESHOLD_PCT': 100.0, 'SELL_STOPLOSS_THRESHOLD_PCT': 50.0,
+             'MAX_TOKEN_AGE_SECONDS': 60, 'WAIT_TIME_AFTER_CREATION_SECONDS': 5,
+             'WAIT_TIME_AFTER_BUY_SECONDS': 10, 'WAIT_TIME_BEFORE_NEW_TOKEN_SECONDS': 5,
+             'MAX_RETRIES': 3, 'MAX_BUY_RETRIES': 3, 'CONFIRM_TIMEOUT_SECONDS': 60,
+             'LISTENER_TYPE': 'logs', 'ENABLE_DYNAMIC_FEE': True, 'ENABLE_FIXED_FEE': False,
+             'PRIORITY_FEE_FIXED_AMOUNT': 10000, 'EXTRA_PRIORITY_FEE': 0,
+             'HARD_CAP_PRIOR_FEE': 1000000, 'RUG_CHECK_CREATOR': False,
+             'RUG_MAX_CREATOR_HOLD_PCT': 30.0, 'RUG_CHECK_PRICE_DROP': False, 'RUG_PRICE_DROP_PCT': 50.0,
+             'RUG_CHECK_LIQUIDITY_DROP': False, 'RUG_LIQUIDITY_DROP_PCT': 60.0, 'CLEANUP_MODE': 'disabled',
+             'CLEANUP_FORCE_CLOSE': False, 'CLEANUP_PRIORITY_FEE': True
+        }
+        for var, default in optional_vars_defaults.items(): config[var.lower()] = getattr(config_module, var, os.getenv(var, default))
+        still_missing = [var for var in required_vars if config.get(var.lower()) is None]
+        if still_missing: raise ValueError(f"Missing required config variables: {', '.join(still_missing)}")
+        elif missing_vars: logger.warning(f"Required variables {[v for v in missing_vars if config.get(v.lower())]} loaded from env.")
+        logger.info(f"Configuration loaded successfully.")
+        return config
+    except ModuleNotFoundError: logger.error(f"Config module not found: '{import_path}'."); raise
+    except ValueError as e: logger.error(f"Config error in '{import_path}': {e}"); raise
+    except Exception as e: logger.error(f"Unexpected error loading config {import_path}: {e}", exc_info=True); raise
 
 
-# --- main function ---
-async def main() -> None:
-    """Main entry point for the CLI."""
-    # Load Config FIRST using temporary parse
-    temp_parser = argparse.ArgumentParser(add_help=False); temp_parser.add_argument("--config", default="src.config"); temp_args, _ = temp_parser.parse_known_args()
-    config = load_config(temp_args.config)
-    # Parse all args using loaded config for defaults
-    args = parse_args(config)
+async def main():
+    args = parser.parse_args()
+    logger.info("--- Starting main() ---")
+    try: config = load_config(args.config)
+    except Exception: logger.error("Exiting due to config load failure."); return
 
-    # Get Config Values & Apply Overrides
+    logger.info("Configuration loaded, initializing components...")
+    async_client: Optional[SolanaPyAsyncClient] = None
+    client: Optional[SolanaClient] = None
+
     try:
-        # Prioritize .env, then loaded config
-        rpc_endpoint = os.environ.get("SOLANA_NODE_RPC_ENDPOINT") or getattr(config, "RPC_ENDPOINT", None)
-        wss_endpoint = os.environ.get("SOLANA_NODE_WSS_ENDPOINT") or getattr(config, "WSS_ENDPOINT", None)
-        # Use SOLANA_PRIVATE_KEY from .env as priority
-        private_key = os.environ.get("SOLANA_PRIVATE_KEY") or getattr(config, "PRIVATE_KEY", None)
+        logger.debug("Initializing SolanaClient...")
+        client = SolanaClient(config['solana_node_rpc_endpoint'])
 
-        if not rpc_endpoint or not rpc_endpoint.startswith(("http://", "https://")): raise ValueError("Invalid/missing RPC endpoint (check .env: SOLANA_NODE_RPC_ENDPOINT or config: RPC_ENDPOINT)")
-        if not private_key or len(private_key) < 80: raise ValueError("Invalid/missing private key (check .env: SOLANA_PRIVATE_KEY or config: PRIVATE_KEY)")
+        logger.debug("Initializing SolanaPy AsyncClient...")
+        async_client = SolanaPyAsyncClient(config['solana_node_rpc_endpoint'])
 
-        listener_type = getattr(config, "LISTENER_TYPE", "logs")
-        if listener_type == "logs" and (not wss_endpoint or not wss_endpoint.startswith(("ws://", "wss://"))):
-             logger.warning(f"WSS endpoint missing/invalid for logs listener. Deriving from RPC: {rpc_endpoint}")
-             wss_fallback = rpc_endpoint.replace("https", "wss").replace("http", "ws")
-             if wss_fallback == rpc_endpoint: raise ValueError("Cannot derive WSS endpoint from RPC for logs listener.")
-             wss_endpoint = wss_fallback; logger.info(f"Using derived WSS: {wss_endpoint}")
-
-        # Apply CLI overrides (already handled by args object from parse_args)
-        buy_amount = args.amount; buy_slippage = args.buy_slippage; sell_slippage = args.sell_slippage
-        rug_check_creator = args.rug_check_creator; rug_max_creator_hold_pct = args.rug_max_creator_hold_pct
-        rug_check_price_drop = args.rug_check_price_drop; rug_price_drop_pct = args.rug_price_drop_pct
-        rug_check_liquidity_drop = args.rug_check_liquidity_drop; rug_liquidity_drop_pct = args.rug_liquidity_drop_pct
-
-        # Fetch remaining params from config using getattr with safe defaults
-        # ** Use names matching PriorityFeeManager **
-        cfg_fixed_fee = getattr(config, "FIXED_PRIORITY_FEE", 2000)
-        cfg_extra_fee = getattr(config, "EXTRA_PRIORITY_FEE", 0.0) # Name matches PriorityFeeManager `extra_fee`
-        cfg_cap = getattr(config, "HARD_CAP_PRIOR_FEE", 200000)     # Name matches PriorityFeeManager `cap`
-        cfg_enable_dynamic_fee = getattr(config, "ENABLE_DYNAMIC_PRIORITY_FEE", False) # Name matches PFM `enable_dynamic_fee`
-        cfg_enable_fixed_fee = getattr(config, "ENABLE_FIXED_PRIORITY_FEE", True) # Name matches PFM `enable_fixed_fee`
-        # Other configs
-        cfg_wait_after_creation = getattr(config, "WAIT_TIME_AFTER_CREATION", 15)
-        cfg_wait_after_buy = getattr(config, "WAIT_TIME_AFTER_BUY", 60)
-        cfg_wait_before_new = getattr(config, "WAIT_TIME_BEFORE_NEW_TOKEN", 15)
-        cfg_sell_profit_threshold = getattr(config, "SELL_PROFIT_THRESHOLD", 0.5)
-        cfg_sell_stoploss_threshold = getattr(config, "SELL_STOPLOSS_THRESHOLD", 0.2)
-        cfg_max_token_age = getattr(config, "MAX_TOKEN_AGE", 60)
-        cfg_max_retries = getattr(config, "MAX_RETRIES", 10)
-        cfg_max_buy_retries = getattr(config, "MAX_BUY_RETRIES", cfg_max_retries) # Default to max_retries if specific one missing
-        cfg_cleanup_mode = getattr(config, "CLEANUP_MODE", "disabled")
-        cfg_cleanup_force_close = getattr(config, "CLEANUP_FORCE_CLOSE", False)
-        cfg_cleanup_priority_fee = getattr(config, "CLEANUP_PRIORITY_FEE", False)
-        cfg_confirm_timeout = getattr(config, "CONFIRM_TIMEOUT", 60) # Add CONFIRM_TIMEOUT to configs or keep default
-
-    except (AttributeError, ValueError, FileNotFoundError) as e:
-        logger.critical(f"Configuration error: {e}. Ensure required variables are set in config/env.", exc_info=True); sys.exit(1)
-
-    # Initialize Components
-    try:
-        wallet = Wallet(private_key)
+        logger.debug("Initializing Wallet...")
+        wallet = Wallet(config['solana_private_key'])
         logger.info(f"Wallet Pubkey: {wallet.pubkey}")
-        # Use SolanaClient as context manager for auto-close
-        async with SolanaClient(rpc_endpoint) as client:
-             # --- Pass correctly named arguments matching PumpTrader.__init__ ---
-             trader = PumpTrader(
-                 client=client, # Pass client instance created by async with
-                 rpc_endpoint=rpc_endpoint, # Pass informational values
-                 wss_endpoint=wss_endpoint, # Pass informational values
-                 private_key=private_key, # Needed by trader to init Wallet internally again? If not, remove.
-                 buy_amount=buy_amount,
-                 buy_slippage=buy_slippage,
-                 sell_slippage=sell_slippage,
-                 sell_profit_threshold=cfg_sell_profit_threshold,
-                 sell_stoploss_threshold=cfg_sell_stoploss_threshold,
-                 max_token_age=cfg_max_token_age,
-                 wait_time_after_creation=cfg_wait_after_creation,
-                 wait_time_after_buy=cfg_wait_after_buy,
-                 wait_time_before_new_token=cfg_wait_before_new,
-                 max_retries=cfg_max_retries,
-                 max_buy_retries=cfg_max_buy_retries,
-                 confirm_timeout=cfg_confirm_timeout,
-                 listener_type=listener_type,
-                 # Pass correct priority fee names matching PumpTrader.__init__
-                 fixed_fee=cfg_fixed_fee,
-                 extra_fee=cfg_extra_fee,
-                 cap=cfg_cap,
-                 enable_dynamic_fee=cfg_enable_dynamic_fee,
-                 enable_fixed_fee=cfg_enable_fixed_fee,
-                 # Pass rug check args
-                 rug_check_creator=rug_check_creator,
-                 rug_max_creator_hold_pct=rug_max_creator_hold_pct,
-                 rug_check_price_drop=rug_check_price_drop,
-                 rug_price_drop_pct=rug_price_drop_pct,
-                 rug_check_liquidity_drop=rug_check_liquidity_drop,
-                 rug_liquidity_drop_pct=rug_liquidity_drop_pct,
-                 # Pass cleanup args
-                 cleanup_mode=cfg_cleanup_mode,
-                 cleanup_force_close=cfg_cleanup_force_close,
-                 cleanup_priority_fee=cfg_cleanup_priority_fee,
-             )
-             # --- Start Trader ---
-             await trader.start(
-                 match_string=args.match,
-                 bro_address=args.bro,
-                 marry_mode=args.marry,
-                 yolo_mode=args.yolo,
-             )
-    except Exception as e:
-        logger.critical(f"Critical error initializing or running trader: {e}", exc_info=True)
-        sys.exit(1)
-    # No explicit client.close() needed here because 'async with' handles it
 
-# --- __main__ block ---
-if __name__ == "__main__":
-    logger.info("Starting pump.fun bot CLI...")
+        logger.debug("Initializing PriorityFeeManager...")
+        priority_fee_manager = PriorityFeeManager(
+            client=async_client, # Pass the SolanaPyAsyncClient instance
+            enable_dynamic_fee=config['enable_dynamic_fee'],
+            enable_fixed_fee=config['enable_fixed_fee'],
+            fixed_fee=config['priority_fee_fixed_amount'],
+            extra_fee=config['extra_priority_fee'],
+            hard_cap=config['hard_cap_prior_fee']
+        )
+        logger.info("Components Wallet, Client, FeeManager Initialized.")
+
+        logger.debug("Initializing PumpTrader...")
+        # Convert values
+        buy_slip_decimal = config['buy_slippage_bps'] / 10000.0
+        sell_slip_decimal = config['sell_slippage_bps'] / 10000.0
+        sell_profit_decimal = config['sell_profit_threshold_pct'] / 100.0
+        sell_stoploss_decimal = config['sell_stoploss_threshold_pct'] / 100.0
+        rug_creator_pct_value = (args.rug_max_creator_hold_pct if args.rug_max_creator_hold_pct is not None else config['rug_max_creator_hold_pct'])
+        rug_creator_pct_decimal = float(rug_creator_pct_value) / 100.0
+        rug_price_drop_decimal = config['rug_price_drop_pct'] / 100.0
+        rug_liq_drop_decimal = config['rug_liquidity_drop_pct'] / 100.0
+
+        trader = PumpTrader(
+             client=client,
+             # --- rpc_endpoint REMOVED ---
+             wss_endpoint=config['solana_node_wss_endpoint'],
+             private_key=config['solana_private_key'],
+             buy_amount=args.amount if args.amount is not None else config['buy_amount'],
+             buy_slippage=buy_slip_decimal,
+             sell_slippage=sell_slip_decimal,
+             sell_profit_threshold=sell_profit_decimal,
+             sell_stoploss_threshold=sell_stoploss_decimal,
+             max_token_age=config['max_token_age_seconds'],
+             wait_time_after_creation=config['wait_time_after_creation_seconds'],
+             wait_time_after_buy=config['wait_time_after_buy_seconds'],
+             wait_time_before_new_token=config['wait_time_before_new_token_seconds'],
+             max_retries=config['max_retries'],
+             max_buy_retries=config['max_buy_retries'],
+             confirm_timeout=config['confirm_timeout_seconds'],
+             listener_type=config['listener_type'],
+             enable_dynamic_fee=config['enable_dynamic_fee'],
+             enable_fixed_fee=config['enable_fixed_fee'],
+             fixed_fee=config['priority_fee_fixed_amount'],
+             extra_fee=config['extra_priority_fee'],
+             cap=config['hard_cap_prior_fee'],
+             rug_check_creator=args.rug_check_creator or config['rug_check_creator'],
+             rug_max_creator_hold_pct=rug_creator_pct_decimal,
+             rug_check_price_drop=config['rug_check_price_drop'],
+             rug_price_drop_pct=rug_price_drop_decimal,
+             rug_check_liquidity_drop=config['rug_check_liquidity_drop'],
+             rug_liquidity_drop_pct=rug_liq_drop_decimal,
+             cleanup_mode=config['cleanup_mode'],
+             cleanup_force_close=config['cleanup_force_close'],
+             cleanup_priority_fee=config['cleanup_priority_fee']
+        )
+        logger.info("PumpTrader Initialized.")
+
+    except KeyError as e: logger.critical(f"FATAL: Missing config key: {e}"); await async_client.close() if async_client else None; return
+    except Exception as e: logger.critical(f"FATAL: Error instantiating components: {e}", exc_info=True); await async_client.close() if async_client else None; return
+
+    # Run trader.start
+    logger.info("Starting trader...")
     try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        logger.info("Bot stopped manually (KeyboardInterrupt).")
+        await trader.start(
+            match_string=args.match,
+            bro_address=args.bro,
+            marry_mode=args.marry,
+            yolo_mode=args.yolo
+        )
     except Exception as e:
-        # Catch errors during asyncio.run() itself or unhandled errors from main()
-        logger.critical(f"Unhandled critical error during execution: {e}", exc_info=True)
+         logger.critical(f"FATAL: Critical error running trader: {e}", exc_info=True)
+    finally:
+         if async_client and hasattr(async_client, 'close') and hasattr(async_client,'is_closed') and not async_client.is_closed():
+             logger.info("Closing async Solana client connection in main finally block...")
+             await async_client.close()
+
+    logger.info("--- main() finished ---")
+
+
+# Define parser globally
+parser = argparse.ArgumentParser(description="Pump.fun Trading Bot")
+parser.add_argument("--config", required=True, help="Python module path to config (e.g., src.config_default)")
+parser.add_argument("--yolo", action="store_true", help="Enable YOLO mode")
+parser.add_argument("--marry", action="store_true", help="Enable Marry mode")
+parser.add_argument("--amount", type=float, help="Override buy amount")
+parser.add_argument("--rug-check-creator", action="store_true", help="Enable creator rug check")
+parser.add_argument("--rug-max-creator-hold-pct", type=float, help="Override creator hold % (e.g. 30.0)")
+parser.add_argument("--match", type=str, help="Token name/symbol filter")
+parser.add_argument("--bro", type=str, help="Creator address filter")
+# Add other arguments...
+
+if __name__ == "__main__":
+     logger.info(f"Starting script execution...")
+     if len(sys.argv) <= 1: parser.print_help(sys.stderr); sys.exit(1)
+     try: asyncio.run(main())
+     except RuntimeError: import nest_asyncio; nest_asyncio.apply(); asyncio.run(main())
+     except KeyboardInterrupt: logger.info("Process interrupted by user.")
+     finally: logger.info(f"Script execution finished.")
