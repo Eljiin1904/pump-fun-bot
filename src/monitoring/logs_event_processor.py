@@ -2,167 +2,151 @@
 
 import base64
 import time
-import asyncio # <-- Keep asyncio import for sleep
-from typing import Optional, List, Dict, Any
+import hashlib
+from typing import Optional, Dict, Any, List
 
+# Imports
 from solders.pubkey import Pubkey
-from solders.signature import Signature
-from solders.transaction import VersionedTransaction, Transaction
-from solders.transaction_status import EncodedConfirmedTransactionWithStatusMeta, UiTransactionEncoding
-# --- Import Exceptions for Retry ---
-from solana.exceptions import SolanaRpcException
-from httpx import ReadTimeout, ConnectTimeout, HTTPStatusError, RequestError
-# --- End Import Exceptions ---
+from httpx import ReadTimeout
 
-# Imports from project
-from ..core.pubkeys import SolanaProgramAddresses, PumpAddresses
+try:
+    from borsh_construct import CStruct
+    from construct import Bytes, Int32ul, PascalString, ConstructError
+    BORSH_IMPORTED_SUCCESSFULLY = True
+except ImportError as e:
+    print(f"CRITICAL: Failed borsh/construct imports in {__name__}. Install/Fix. Error: {e}")
+    BORSH_IMPORTED_SUCCESSFULLY = False
+    CStruct = PascalString = Int32ul = Bytes = object
+    ConstructError = Exception
+
+# Project Imports
 from ..core.client import SolanaClient
+from ..core.curve import BondingCurveManager
 from ..trading.base import TokenInfo
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# --- Placeholders - Needs Verification ---
-# CRITICAL: Replace these with values verified from explorer/IDL
-CREATE_IX_DISCRIMINATOR_PLACEHOLDER = b'\x1a\xc2\x0a\xca\x91\x89\x96\xd7' # Example "global:create" - VERIFY!
-MINT_INDEX_IN_CREATE = 0 # VERIFY!
-BONDING_CURVE_INDEX_IN_CREATE = 1 # VERIFY!
-ASSOC_BONDING_CURVE_INDEX_IN_CREATE = 2 # VERIFY! SOL Vault
-CREATOR_INDEX_IN_CREATE = 10 # VERIFY!
-# --- End Placeholders ---
-
-# --- Constants for Retry Logic ---
-GET_TX_RETRIES = 3
-GET_TX_INITIAL_DELAY = 0.5 # Initial delay in seconds
-GET_TX_BACKOFF_FACTOR = 2   # Factor to increase delay each retry (e.g., 0.5, 1.0, 2.0)
-# --- End Constants ---
+CREATE_EVENT_DISCRIMINATOR = hashlib.sha256(b"event:CreateEvent").digest()[:8]
+logger.info(f"Using Create Event Discriminator: {CREATE_EVENT_DISCRIMINATOR.hex()}")
 
 class LogsEventProcessor:
-    """Processes transaction details fetched based on log notifications."""
+    """Processes event data from logs and fetches related account details."""
+
+    CREATE_EVENT_LAYOUT: Optional[Any] = None
+    if BORSH_IMPORTED_SUCCESSFULLY:
+        try:
+            CREATE_EVENT_LAYOUT = CStruct(
+                "name" / PascalString(Int32ul, "utf8"),
+                "symbol" / PascalString(Int32ul, "utf8"),
+                "uri" / PascalString(Int32ul, "utf8"),
+                "mint" / Bytes(32),
+                "bonding_curve" / Bytes(32),
+                "user" / Bytes(32)
+            )
+            logger.info("LogsEventProcessor.CREATE_EVENT_LAYOUT defined successfully.")
+        except Exception as e:
+            logger.critical(f"Failed to define LogsEventProcessor.CREATE_EVENT_LAYOUT: {e}", exc_info=True)
+            CREATE_EVENT_LAYOUT = None
+    else:
+        logger.critical("Cannot define LogsEventProcessor.CREATE_EVENT_LAYOUT due to missing imports.")
 
     def __init__(self, client: SolanaClient):
         self.client_wrapper = client
         try:
-            self.async_client = client.get_async_client() # Get async client via wrapper method
-            if self.async_client is None: raise AttributeError("get_async_client() returned None")
-        except AttributeError: logger.critical("FATAL: Missing get_async_client() on SolanaClient!"); raise
-        except Exception as e: logger.critical(f"FATAL: Error getting async client: {e}", exc_info=True); raise
+            self.curve_manager = BondingCurveManager(client)
+        except Exception as e:
+            logger.critical(f"FATAL: Error initializing LogsEventProcessor: {e}", exc_info=True)
+            raise
+        logger.info("LogsEventProcessor initialized.")
 
-    async def extract_token_info_from_tx(self, signature: str) -> Optional[TokenInfo]:
-        """
-        Fetches transaction details by signature with retries, and attempts to parse
-        pump.fun 'Create' instruction details to extract token information.
-        """
-        logger.debug(f"Attempting extraction for sig: {signature}")
-        sig_obj = Signature.from_string(signature)
-        tx_details: Optional[EncodedConfirmedTransactionWithStatusMeta] = None
-        last_error: Optional[Exception] = None
-
-        # --- Retry Loop for get_transaction ---
-        for attempt in range(GET_TX_RETRIES):
-            try:
-                logger.debug(f"get_transaction attempt {attempt + 1}/{GET_TX_RETRIES} for {signature}")
-                tx_resp = await self.async_client.get_transaction(
-                    sig_obj,
-                    max_supported_transaction_version=0,
-                    commitment="confirmed",
-                    encoding="base64" # Use base64 encoding
-                )
-
-                if tx_resp is not None and tx_resp.value is not None:
-                    tx_details = tx_resp.value
-                    logger.debug(f"get_transaction successful for {signature} on attempt {attempt + 1}")
-                    break # Exit loop on success
-                else:
-                    # Log specific error if available in response, otherwise generic invalid
-                    rpc_error = tx_resp.error if tx_resp and hasattr(tx_resp, 'error') else "Invalid/Null Response"
-                    logger.warning(f"get_transaction attempt {attempt + 1} invalid response for {signature}. Error: {rpc_error}")
-                    # Decide if retryable based on error? For now, retry invalid response once or twice.
-                    if attempt < GET_TX_RETRIES - 1:
-                        delay = GET_TX_INITIAL_DELAY * (GET_TX_BACKOFF_FACTOR ** attempt)
-                        logger.warning(f"Retrying after {delay:.2f}s...")
-                        await asyncio.sleep(delay)
-                        continue # Go to next attempt
-                    else:
-                        logger.error(f"Failed get_transaction after {GET_TX_RETRIES} attempts (invalid response): {signature}")
-                        return None # Failed after retries
-
-            # --- Catch Specific Retryable Errors ---
-            except (SolanaRpcException, ReadTimeout, ConnectTimeout, RequestError, HTTPStatusError) as e:
-                last_error = e # Store last error
-                logger.warning(f"get_transaction attempt {attempt + 1} failed for {signature} with {type(e).__name__}: {e}.")
-                if attempt < GET_TX_RETRIES - 1:
-                    delay = GET_TX_INITIAL_DELAY * (GET_TX_BACKOFF_FACTOR ** attempt)
-                    logger.warning(f"Retrying after {delay:.2f}s...")
-                    await asyncio.sleep(delay)
-                    continue # Go to next attempt
-                else:
-                    logger.error(f"Failed get_transaction after {GET_TX_RETRIES} attempts ({type(e).__name__}): {signature}")
-                    return None # Failed after retries
-
-            # Catch other unexpected errors during fetch attempt
-            except Exception as e:
-                 last_error = e # Store last error
-                 logger.error(f"Unexpected error in get_transaction attempt {attempt+1} for {signature}: {e}", exc_info=True)
-                 # Stop retrying on unexpected errors
-                 return None
-        # --- End Retry Loop ---
-
-        # Check if tx_details was successfully populated after loop
-        if tx_details is None:
-            logger.error(f"Failed to get valid transaction details for {signature} after all retries. Last error: {last_error}")
+    # --- FIX: Added signature parameter for logging ---
+    def _parse_create_event_log_data(self, signature: str, log_data_base64: str) -> Optional[Dict[str, Any]]:
+    # --- End Fix ---
+        """Decodes and deserializes Create event data, converting pubkey bytes."""
+        if self.CREATE_EVENT_LAYOUT is None:
+            logger.error(f"Cannot parse event for {signature}: CREATE_EVENT_LAYOUT is invalid.")
             return None
-
-        # --- Proceed with Processing if tx_details is valid ---
         try:
-            tx = tx_details.transaction
-            if tx is None: logger.warning(f"Response missing tx details for {signature}"); return None
-            meta = tx.meta
+            log_data_bytes = base64.b64decode(log_data_base64)
+            if not log_data_bytes.startswith(CREATE_EVENT_DISCRIMINATOR):
+                return None
 
-            if meta is None or meta.err is not None: logger.debug(f"Tx {signature} failed (err={meta.err}) or no meta."); return None
+            data_args = log_data_bytes[8:]
 
-            inner_tx = tx.transaction
-            if isinstance(inner_tx, VersionedTransaction): message = inner_tx.message
-            elif isinstance(inner_tx, Transaction): message = inner_tx.message
-            else: logger.error(f"Unexpected tx type {signature}: {type(inner_tx)}"); return None
+            # --- Add basic length check ---
+            min_expected_size = 32 + 32 + 32
+            if len(data_args) < min_expected_size:
+                 logger.warning(f"Skipping parse for {signature}: data length {len(data_args)} seems too short for layout.")
+                 return None
+            # --- End length check ---
 
-            # --- Find 'Create' IX ---
-            create_ix_details = None; pump_program_id_str = str(PumpAddresses.PROGRAM)
-            for ix in message.instructions:
-                # Added check for length before indexing account_keys
-                if ix.program_id_index < len(message.account_keys):
-                    prog_id = message.account_keys[ix.program_id_index]
-                    if str(prog_id) == pump_program_id_str and ix.data.startswith(CREATE_IX_DISCRIMINATOR_PLACEHOLDER): # Use actual discriminator
-                        logger.debug(f"Found potential Create IX in {signature}"); create_ix_details = ix; break
-            if not create_ix_details: logger.debug(f"No Create IX found in {signature}"); return None
+            parsed_event_raw = self.CREATE_EVENT_LAYOUT.parse(data_args)
+            # logger.info( f"Parsed Create event raw for {signature}: Name='{parsed_event_raw.get('name')}', Symbol='{parsed_event_raw.get('symbol')}'" )
 
-            # --- Extract accounts --- (VERIFY INDICES!)
-            try:
-                 # Added check for accounts list length
-                 if len(create_ix_details.accounts) <= max(MINT_INDEX_IN_CREATE, BONDING_CURVE_INDEX_IN_CREATE, ASSOC_BONDING_CURVE_INDEX_IN_CREATE, CREATOR_INDEX_IN_CREATE):
-                      logger.error(f"Instruction accounts length mismatch for Create IX {signature}. Check indices.")
-                      return None
-                 # Access accounts using verified indices
-                 mint_pk = message.account_keys[create_ix_details.accounts[MINT_INDEX_IN_CREATE]]
-                 bonding_curve_pk = message.account_keys[create_ix_details.accounts[BONDING_CURVE_INDEX_IN_CREATE]]
-                 assoc_bc_pk = message.account_keys[create_ix_details.accounts[ASSOC_BONDING_CURVE_INDEX_IN_CREATE]]
-                 creator_pk = message.account_keys[create_ix_details.accounts[CREATOR_INDEX_IN_CREATE]]
-                 logger.debug(f"Extracted Accounts: Mint={mint_pk}, Curve={bonding_curve_pk}, Vault={assoc_bc_pk}, Creator={creator_pk}")
-            except IndexError: logger.error(f"Account index OOB parsing Create IX {signature}. Check layout/indices."); return None
-            except Exception as e: logger.error(f"Error extracting accounts {signature}: {e}", exc_info=True); return None
+            parsed_event_final = {}
+            parsed_event_final["name"] = parsed_event_raw.get("name")
+            parsed_event_final["symbol"] = parsed_event_raw.get("symbol")
+            parsed_event_final["uri"] = parsed_event_raw.get("uri")
+            mint_bytes = parsed_event_raw.get("mint")
+            curve_bytes = parsed_event_raw.get("bonding_curve")
+            user_bytes = parsed_event_raw.get("user")
 
-            # --- Extract metadata --- (Placeholder - NEEDS IMPLEMENTATION!)
-            name = f"NAME_{str(mint_pk)[:4]}"; symbol = f"SYM_{str(mint_pk)[-3:]}"; uri = f"http://placeholder.com/{mint_pk}"
-            logger.warning(f"Using placeholder metadata extraction for {signature}.")
-            # Add actual argument parsing logic here using struct.unpack or borsh
+            if not all([mint_bytes, curve_bytes, user_bytes]):
+                 logger.error(f"Essential byte fields missing after parsing for {signature}. Raw: {parsed_event_raw}")
+                 return None
 
-            logger.info(f"Successfully extracted basic info for mint {mint_pk} from tx {signature}")
-            block_time = tx.block_time if tx.block_time else time.time()
-            return TokenInfo(
-                 name=name, symbol=symbol, uri=uri, mint=mint_pk,
-                 bonding_curve=bonding_curve_pk, associated_bonding_curve=assoc_bc_pk,
-                 user=creator_pk, created_timestamp=block_time
-            )
-        except Exception as e: # Catch errors during processing *after* getting tx details
-            logger.error(f"Unexpected error processing tx details for {signature}: {e}", exc_info=True)
+            parsed_event_final["mint"] = Pubkey(mint_bytes)
+            parsed_event_final["bonding_curve"] = Pubkey(curve_bytes)
+            parsed_event_final["user"] = Pubkey(user_bytes)
+
+            return parsed_event_final
+        except ConstructError as e:
+            logger.warning(f"Borsh construct parse event error for {signature} (data likely doesn't match layout - maybe different event?): {e}")
+            logger.debug(f"Problematic data (hex) for {signature}: {data_args.hex() if 'data_args' in locals() else 'N/A'}")
             return None
+        except base64.binascii.Error as e:
+            logger.error(f"Base64 decode error for {signature}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Unexpected parse event error for {signature}: {e}", exc_info=True)
+            return None
+
+    async def _fetch_sol_vault_address(self, mint_pubkey: Pubkey) -> Optional[Pubkey]:
+        """ Computes the SOL vault address (associated bonding curve PDA). """
+        try:
+            assoc_bc_pk, _ = BondingCurveManager.find_associated_bonding_curve_pda(mint_pubkey)
+            return assoc_bc_pk
+        except Exception as e:
+            logger.error(f"Error computing associated bonding curve PDA for mint {mint_pubkey}: {e}", exc_info=True)
+            return None
+
+    async def process_create_event(self, logs: List[str], signature: str) -> Optional[TokenInfo]:
+        """ Finds a Create event log, parses it, computes SOL vault, returns TokenInfo. """
+        logger.debug(f"Processing create event logs for signature: {signature}")
+        program_data_log: Optional[str] = None; create_ix_log_index = -1
+        try:
+            create_ix_log_index = next(i for i, log in enumerate(logs) if "Program log: Instruction: Create" in log)
+            program_data_log = next((log for log in logs[create_ix_log_index+1:] if log.startswith("Program data:")), None)
+        except StopIteration: return None
+        if not program_data_log: return None
+
+        try:
+            parts = program_data_log.split(": ");
+            if len(parts) < 2: logger.error(f"Could not split 'Program data:' log line for {signature}. Log: '{program_data_log}'"); return None
+            encoded_data = parts[1].strip()
+            # Pass signature for better logging
+            parsed_event_data = self._parse_create_event_log_data(signature, encoded_data)
+            if not parsed_event_data: return None
+
+            mint_pk = parsed_event_data.get("mint"); bonding_curve_pda = parsed_event_data.get("bonding_curve"); creator_pk = parsed_event_data.get("user")
+            name = parsed_event_data.get("name", "N/A"); symbol = parsed_event_data.get("symbol", "N/A"); uri = parsed_event_data.get("uri", "")
+            if not all([mint_pk, bonding_curve_pda, creator_pk]): logger.error(f"Essential Pubkeys missing after parsing for {signature}. Parsed: {parsed_event_data}"); return None
+
+            assoc_bc_pk = await self._fetch_sol_vault_address(mint_pk)
+            if not assoc_bc_pk: logger.error(f"Failed to compute associated bonding curve PDA for mint {mint_pk} ({signature})"); return None
+
+            logger.info(f"Successfully processed create event for mint {mint_pk}")
+            creation_timestamp = time.time()
+            return TokenInfo( name=name, symbol=symbol, uri=uri, mint=mint_pk, bonding_curve=bonding_curve_pda, associated_bonding_curve=assoc_bc_pk, user=creator_pk, created_timestamp=creation_timestamp )
+        except Exception as e: logger.error(f"Error processing create event {signature}: {e}", exc_info=True); return None

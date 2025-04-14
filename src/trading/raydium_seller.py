@@ -1,152 +1,124 @@
 # src/trading/raydium_seller.py
-# Implements selling on DEX via Jupiter V6 API
 
-import httpx
-import base64
-# import time # Unused
-# import asyncio # Unused
-# Remove List if Dict, Optional, Any are sufficient
-from typing import Optional, Dict, Any # Removed List
+import asyncio
+from typing import Optional
 
 from solders.pubkey import Pubkey
-# from solders.keypair import Keypair # Unused type import
-from solders.transaction import VersionedTransaction
-from solders.signature import Signature
-# --- Import Commitment types ---
-from solders.commitment_config import CommitmentLevel # For type hint if needed by client.confirm
-from solana.rpc.commitment import Confirmed # Import specific commitment level
-# --- End Import ---
-from solders.transaction_status import TransactionConfirmationStatus
+# Import necessary transaction types if building transactions here
+from solders.transaction import VersionedTransaction, Transaction # Example if needed
+from solders.message import Message # Example if needed
+from solders.compute_budget import set_compute_unit_price, set_compute_unit_limit
+from solders.signature import Signature # If needed for confirmation return
+from solana.rpc.commitment import Confirmed
+# Removed unused import: from ..core.transactions import TransactionResult
 
-# Define Constants Locally
-LAMPORTS_PER_SOL = 1_000_000_000
-DEFAULT_TOKEN_DECIMALS = 6
-SOL_MINT_ADDRESS = "So11111111111111111111111111111111111111112"
-
-# Core/Helper Imports
 from ..core.client import SolanaClient
 from ..core.wallet import Wallet
-# Remove build_and_send if using direct send exclusively here
-# from ..core.transactions import build_and_send_transaction
-from ..core.transactions import TransactionResult # Keep Result type
-from ..trading.base import TokenInfo, TradeResult
+# --- FIX: Correct imports from curve ---
+# Assuming these constants might be used for display/logging if implemented
+from ..core.curve import LAMPORTS_PER_SOL, DEFAULT_TOKEN_DECIMALS
+# --- End Fix ---
+from ..trading.base import TokenInfo, TradeResult # Assuming TradeResult is correctly defined
 from ..utils.logger import get_logger
+# Need instruction builder if building swap instructions here
+# from ..core.instruction_builder import InstructionBuilder # Uncomment if used
+
+# --- FIX: Import PriorityFeeManager if it's used here ---
+# This was missing, causing potential errors if self.priority_fee_manager is used
+from ..core.priority_fee.manager import PriorityFeeManager
+# --- End Fix ---
+
 
 logger = get_logger(__name__)
 
-# Jupiter V6 API Endpoints
-JUPITER_QUOTE_API = "https://quote-api.jup.ag/v6/quote"
-JUPITER_SWAP_API = "https://quote-api.jup.ag/v6/swap"
-
-REQUEST_TIMEOUT = 30.0
+# Placeholder for Raydium AMM ID and potentially other constants
+# Replace with actual Raydium Liquidity Pool V4 program ID if interacting directly
+# RAYDIUM_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8") # Example V4 ID
+# Might need Wrapped SOL mint address
+# SOL_MINT = Pubkey.from_string("So11111111111111111111111111111111111111112") # Example
 
 class RaydiumSeller:
-    """ Handles selling tokens on DEX via Jupiter aggregator. """
+    """ Handles selling tokens on Raydium DEX. (Currently Placeholder) """
 
-    def __init__(
-        self,
-        client: SolanaClient,
-        wallet: Wallet,
-        slippage_bps: int = 500
-        ):
+    # Add PriorityFeeManager to init if needed
+    def __init__(self, client: SolanaClient, wallet: Wallet, priority_fee_manager: PriorityFeeManager, slippage_bps: int = 50):
         self.client = client
         self.wallet = wallet
-        self.slippage_bps = slippage_bps
-        self.async_client = client.get_async_client()
-        logger.info(f"RaydiumSeller initialized with Slippage: {self.slippage_bps} BPS")
-
-    # _get_jupiter_quote method remains the same
-    async def _get_jupiter_quote( self, input_mint: Pubkey, output_mint: Pubkey, amount_lamports: int) -> Optional[Dict[str, Any]]:
-        # ... (implementation as before) ...
-        logger.debug(f"Fetching Jupiter quote: {amount_lamports} lamports {input_mint} -> {output_mint}")
-        params = { "inputMint": str(input_mint), "outputMint": str(output_mint), "amount": str(amount_lamports), "slippageBps": self.slippage_bps }
-        try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-                response = await client.get(JUPITER_QUOTE_API, params=params); response.raise_for_status(); quote_response = response.json();
-                if not quote_response or not isinstance(quote_response, dict) or "outAmount" not in quote_response: logger.error(f"Invalid quote response: {quote_response}"); return None
-                logger.info(f"Jupiter quote: Sell {amount_lamports / (10**DEFAULT_TOKEN_DECIMALS):.4f} -> Min {int(quote_response.get('otherAmountThreshold',0))/(10**DEFAULT_TOKEN_DECIMALS):.4f} SOL")
-                return quote_response
-        except httpx.HTTPStatusError as e: logger.error(f"HTTP error Jupiter quote: {e.response.status_code} - {e.response.text}"); return None
-        except Exception as e: logger.error(f"Error Jupiter quote: {e}", exc_info=True); return None
-
-    # _get_jupiter_swap_tx method remains the same
-    async def _get_jupiter_swap_tx( self, quote_response: Dict[str, Any], user_pubkey: Pubkey) -> Optional[Dict[str, Any]]:
-        # ... (implementation as before) ...
-        logger.debug("Fetching Jupiter swap transaction...")
-        payload = { "quoteResponse": quote_response, "userPublicKey": str(user_pubkey), "wrapAndUnwrapSol": True, "dynamicComputeUnitLimit": True, "prioritizationFeeLamports": "auto"}
-        try:
-            async with httpx.AsyncClient(timeout=REQUEST_TIMEOUT) as client:
-                response = await client.post(JUPITER_SWAP_API, json=payload); response.raise_for_status(); swap_response = response.json();
-                if not swap_response or not isinstance(swap_response, dict) or "swapTransaction" not in swap_response: logger.error(f"Invalid swap response: {swap_response}"); return None
-                logger.info("Jupiter swap transaction received."); return swap_response
-        except httpx.HTTPStatusError as e: logger.error(f"HTTP error Jupiter swap tx: {e.response.status_code} - {e.response.text}"); return None
-        except Exception as e: logger.error(f"Error Jupiter swap tx: {e}", exc_info=True); return None
-
+        self.priority_fee_manager = priority_fee_manager # Store the fee manager
+        self.slippage_bps = slippage_bps # Slippage in basis points (e.g., 50 = 0.5%)
+        logger.info(f"RaydiumSeller Init: Slippage={self.slippage_bps / 100:.2f}%")
 
     async def execute(self, token_info: TokenInfo, amount_to_sell_lamports: int) -> TradeResult:
-        """ Executes the sell via Jupiter using direct send. """
-        logger.info(f"Executing DEX sell {amount_to_sell_lamports} lamports {token_info.symbol} ({token_info.mint}) via Jupiter...")
-        if amount_to_sell_lamports <= 0: return TradeResult(success=False, error_message="Amount <= 0")
+        """ Builds and executes a swap transaction on Raydium. (Currently Placeholder) """
+        logger.info(f"Attempting Raydium sell for {token_info.symbol}, Amount: {amount_to_sell_lamports}")
+        if amount_to_sell_lamports <= 0:
+            return TradeResult(success=False, error_message="Amount to sell must be positive.")
 
-        # 1. Get Quote
-        quote_response = await self._get_jupiter_quote(token_info.mint, Pubkey.from_string(SOL_MINT_ADDRESS), amount_to_sell_lamports)
-        if not quote_response: return TradeResult(success=False, error_message="Failed Jupiter quote")
+        # --- !!! Placeholder: Raydium Interaction Logic !!! ---
+        # This requires significant integration with Raydium SDK/API or building instructions manually.
+        # The following is a *highly simplified* placeholder structure.
+        # You NEED to replace this with actual Raydium swap logic using appropriate libraries or instruction builders.
 
-        est_price: Optional[float] = None
-        try: est_out_lamports = int(quote_response.get("outAmount", 0)); est_price = (est_out_lamports / LAMPORTS_PER_SOL) / (amount_to_sell_lamports / (10**DEFAULT_TOKEN_DECIMALS)) if amount_to_sell_lamports > 0 else 0; logger.info(f"Quote est price: {est_price:.9f} SOL/Token")
-        except Exception as price_e: logger.warning(f"Could not calc price from quote: {price_e}")
-
-        # 2. Get Swap Transaction
-        swap_response = await self._get_jupiter_swap_tx(quote_response, self.wallet.pubkey)
-        if not swap_response: return TradeResult(success=False, error_message="Failed Jupiter swap tx", price=est_price)
-
-        # 3. Deserialize, Sign, Send, Confirm
-        swap_tx_str = swap_response.get("swapTransaction")
-        if not swap_tx_str: return TradeResult(success=False, error_message="Jupiter response missing swapTransaction", price=est_price)
-
-        final_signature: Optional[Signature] = None; error_message = "Transaction failed"; error_type = "Unknown"
         try:
-            logger.info("Processing Jupiter swap transaction...")
-            swap_tx_bytes = base64.b64decode(swap_tx_str)
-            swap_tx_deserialized = VersionedTransaction.from_bytes(swap_tx_bytes)
+            # 1. Find Raydium Pool Keys (Requires external data/SDK)
+            # Example: pool_keys = await find_raydium_pool_keys(token_info.mint)
+            # if not pool_keys: return TradeResult(success=False, error_message="Raydium pool not found.")
 
-            # --- Corrected Signing ---
-            # Sign the deserialized transaction INSTANCE
-            swap_tx_signed = swap_tx_deserialized.sign([self.wallet.payer])
-            # --- End Correction ---
+            # 2. Calculate Minimum SOL Out (Requires pool state & calculations)
+            # Example: min_sol_out_lamports = await calculate_raydium_min_out(pool_keys, amount_to_sell_lamports, self.slippage_bps)
 
-            raw_tx_bytes = bytes(swap_tx_signed)
+            # 3. Get Priority Fee
+            fee = 0
+            try:
+                # --- FIX: Ensure fee manager is called correctly ---
+                fee = await self.priority_fee_manager.get_fee()
+                # --- End Fix ---
+            except Exception as fee_e:
+                logger.warning(f"Could not get priority fee for Raydium sell: {fee_e}")
 
-            # Direct Send using Async Client
-            opts = self.client.get_default_send_options(skip_preflight=False)
-            logger.debug(f"Sending raw Jupiter swap tx ({len(raw_tx_bytes)} bytes)...")
-            txid_resp = await self.async_client.send_raw_transaction(raw_tx_bytes, opts=opts)
-            final_signature = txid_resp.value # Signature object
-            logger.info(f"Jupiter Swap TX Sent: {str(final_signature)}")
+            # 4. Build Raydium Swap Instruction (Requires Raydium library/knowledge)
+            # Example: swap_ix = build_raydium_swap_instruction(...)
+            # instructions = [
+            #    set_compute_unit_limit(400_000),
+            #    set_compute_unit_price(int(fee)),
+            #    swap_ix
+            # ]
 
-            # Confirmation
-            logger.debug(f"Confirming Jupiter Swap TX: {str(final_signature)}")
-            # --- Pass Commitment Enum ---
-            confirmation_status = await self.client.confirm_transaction(
-                 final_signature, commitment=Confirmed, timeout_secs=90 # Use Confirmed enum
-            )
-            # --- End Pass Enum ---
+            # --- !!! TEMPORARY: Simulate Failure as logic is missing ---
+            await asyncio.sleep(0.1) # Simulate some async work
+            logger.error("Raydium selling logic is not implemented yet.")
+            return TradeResult(success=False, error_message="Raydium selling not implemented.")
+            # --- !!! END TEMPORARY ---
 
-            # --- Use str() for status name ---
-            status_str = str(confirmation_status) if confirmation_status else "Unknown/Timeout"
-            # --- End Use str() ---
+            # --- (Actual Logic Would Go Here) ---
+            # # 5. Get recent blockhash
+            # blockhash_resp = await self.client.get_latest_blockhash()
+            # if not blockhash_resp or not getattr(blockhash_resp, 'value', None): # Safer access
+            #     return TradeResult(success=False, error_message="Failed to get recent blockhash")
+            # recent_blockhash = blockhash_resp.value.blockhash # Access blockhash correctly
 
-            if confirmation_status == TransactionConfirmationStatus.Confirmed or confirmation_status == TransactionConfirmationStatus.Finalized:
-                 logger.info(f"Jupiter Swap TX CONFIRMED: {str(final_signature)}")
-                 return TradeResult(
-                     success=True, signature=str(final_signature),
-                     price=est_price, amount=amount_to_sell_lamports / (10**DEFAULT_TOKEN_DECIMALS)
-                 )
-            else:
-                 error_message = f"Swap tx confirm failed/timed out. Status: {status_str}"; error_type = "ConfirmTimeout"; logger.warning(error_message)
+            # # 6. Create and Sign Transaction
+            # msg = Message(instructions, self.wallet.pubkey)
+            # # Sign using the payer's keypair from the Wallet object
+            # tx = VersionedTransaction.populate(msg, [self.wallet.payer]) # Use populate for signing
+
+            # # 7. Send and Confirm
+            # opts = self.client.get_default_send_options(skip_preflight=True)
+            # signature_maybe = await self.client.send_transaction(tx, opts) # Returns Optional[Signature]
+            # if not signature_maybe:
+            #     return TradeResult(success=False, error_message="Failed to send Raydium swap transaction")
+
+            # confirmed_status = await self.client.confirm_transaction(signature_maybe) # Returns Optional[Status]
+            # if not confirmed_status or confirmed_status < Confirmed: # Check if confirmation succeeded at desired level
+            #      return TradeResult(success=False, error_message="Raydium swap transaction confirmation failed/timeout.")
+
+            # logger.info(f"Raydium sell successful for {token_info.symbol}. Tx: {signature_maybe}")
+            # # Parse logs/fetch balance to get actual SOL out
+            # actual_sol_out = 0 # Placeholder
+            # price = actual_sol_out / amount_to_sell_lamports if amount_to_sell_lamports > 0 else 0
+            # return TradeResult(success=True, tx_signature=str(signature_maybe), price=price, amount=actual_sol_out / LAMPORTS_PER_SOL)
+            # --- (End Actual Logic) ---
 
         except Exception as e:
-            error_message = f"Error during Jupiter swap execution: {e}"; error_type = "SwapExecutionError"; logger.error(error_message, exc_info=True)
-
-        # Return failure
-        return TradeResult( success=False, error_message=error_message, error_type=error_type, signature=str(final_signature) if final_signature else None, price=est_price )
+            logger.error(f"Error during Raydium sell process for {token_info.symbol}: {e}", exc_info=True)
+            return TradeResult(success=False, error_message=f"Raydium sell execution error: {e}")

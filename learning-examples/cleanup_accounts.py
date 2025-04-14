@@ -1,82 +1,96 @@
-# learning-examples/cleanup_accounts.py (Corrected Imports and Logic)
+# learning-examples/cleanup_accounts.py
 
 import asyncio
 import os
 import sys
 from dotenv import load_dotenv
-from typing import List, Optional
+from typing import List, Optional, Any # Use Any for balance response type hint
 
+# --- Solana/SPL Imports ---
 from solders.pubkey import Pubkey
-from solders.instruction import Instruction
-from solders.keypair import Keypair
-# SPL Token Instructions
-from spl.token.instructions import BurnParams, CloseAccountParams, burn, close_account
+from spl.token.instructions import CloseAccountParams, close_account # Only need close_account here
 from solana.rpc.commitment import Confirmed
-from solana.rpc.types import TokenAmount # For type hint
-from solana.rpc.async_api import AsyncClient # Use standard async client
+# --- FIX: Remove incorrect TokenAmount import ---
+# from solana.rpc.types import TokenAmount # REMOVE THIS LINE
+# --- End Fix ---
+from solana.rpc.async_api import AsyncClient
 from solana.exceptions import SolanaRpcException
+from solders.signature import Signature # Import for type hinting/usage
 
 # --- Add Project Root to Path ---
+# This allows importing from 'src' when run from the learning-examples dir
 script_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(script_dir)
+project_root = os.path.dirname(script_dir) # This should be the main project root
 if project_root not in sys.path:
     sys.path.insert(0, project_root)
 # --- End Path ---
 
 # --- Use Absolute Imports from src ---
 try:
-    # Import the correct class name
-    from src.core.pubkeys import SolanaProgramAddresses
-    # Import helper functions and classes needed
+    # Import necessary components from your project
+    from src.core.pubkeys import SolanaProgramAddresses, TOKEN_PROGRAM_ID # Import class and constant
     from src.core.wallet import Wallet
-    from src.core.transactions import build_and_send_transaction, TransactionResult # Import helper
-    from src.utils.logger import get_logger
-    # Note: We don't need the full SolanaClient wrapper or PriorityFeeManager for this basic script
+    from src.core.transactions import build_and_send_transaction, TransactionResult
+    # Assuming basic logger setup if running standalone
+    try: from src.utils.logger import get_logger
+    except ImportError: import logging; logging.basicConfig(level=logging.INFO); logger = logging.getLogger(__name__) # Basic fallback logger
 except ImportError as e:
     print(f"ERROR: Could not import required modules from src: {e}")
+    print("Ensure you run this script from the project root or that src is in PYTHONPATH.")
     sys.exit(1)
 # --- End Imports ---
 
-load_dotenv()
-logger = get_logger(__name__)
+# Load .env file from project root
+dotenv_path = os.path.join(project_root, '.env')
+load_dotenv(dotenv_path=dotenv_path)
+logger = get_logger(__name__) # Use the imported logger
 
 RPC_ENDPOINT = os.getenv("SOLANA_NODE_RPC_ENDPOINT")
 PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
 
 # --- !!! IMPORTANT: Update this address !!! ---
 # Replace with a MINT address of a token account YOU OWN and WANT TO CLOSE
-MINT_ADDRESS_TO_CLOSE_STR = "9WHpYbqG6LJvfCYfMjvGbyo1wHXgroCrixPb33s2pump" # EXAMPLE ONLY
+# Using a placeholder that should cause an error if not changed
+MINT_ADDRESS_TO_CLOSE_STR = "EXAMPLE_MINT_ADDRESS_REPLACE_ME"
 
 
 async def close_account_if_exists(
-    async_client: AsyncClient, # Expect standard async client
-    wallet: Wallet,           # Expect Wallet object
-    account_to_close: Pubkey, # The ATA to close
-    mint: Pubkey              # The mint of the ATA
+    async_client: AsyncClient,
+    wallet: Wallet,
+    account_to_close: Pubkey,
+    mint: Pubkey # Keep mint for logging/label
     ):
-    """Safely close a token account if it exists and reclaim rent."""
-    logger.info(f"Attempting to process account: {account_to_close}")
+    """Safely close a token account if it exists and has zero balance."""
+    logger.info(f"Attempting to process ATA: {account_to_close} for Mint: {mint}")
     try:
         # 1. Check if account exists
         acc_info_res = await async_client.get_account_info(account_to_close, commitment=Confirmed)
-        if acc_info_res.value is None:
+        # Check the 'value' attribute of the response object
+        if acc_info_res is None or getattr(acc_info_res, 'value', None) is None:
             logger.info(f"Account does not exist or already closed: {account_to_close}")
             return TransactionResult(success=True, error_message="Skipped: Account does not exist", error_type="Skip")
 
-        # 2. Check balance (optional, closing fails if balance > 0 anyway unless owner burns first)
+        # 2. Check balance
+        # get_token_account_balance returns a response object, check its 'value'
         balance_res = await async_client.get_token_account_balance(account_to_close, commitment=Confirmed)
+        balance_value: Optional[Any] = getattr(balance_res, 'value', None) # Get the value part
         balance_amount = 0
-        if balance_res and balance_res.value and hasattr(balance_res.value, 'amount') and balance_res.value.amount.isdigit():
-             balance_amount = int(balance_res.value.amount)
+
+        # --- FIX: Check attributes on balance_value ---
+        if balance_value and hasattr(balance_value, 'amount') and hasattr(balance_value, 'ui_amount_string'):
+            try:
+                # The 'amount' attribute is a string representing the raw u64 balance
+                balance_amount = int(balance_value.amount)
+            except (ValueError, TypeError):
+                logger.warning(f"Could not parse balance amount '{getattr(balance_value, 'amount', 'N/A')}' for {account_to_close}. Assuming 0.")
+        elif balance_value is not None:
+             logger.warning(f"Unexpected balance response structure for {account_to_close}: {balance_value}")
+        # If balance_value is None, balance_amount remains 0
 
         if balance_amount > 0:
              logger.error(f"Cannot close account {account_to_close}: Balance is {balance_amount}. Tokens must be transferred or burned first.")
-             # You could add burning logic here if desired, like in the original attempt
-             # burn_ix = burn(...)
-             # burn_result = await build_and_send_transaction(...)
-             # if not burn_result.success: return TransactionResult(...) # Return burn failure
              return TransactionResult(success=False, error_message="Failed: Non-zero balance", error_type="Balance > 0")
-
+        # --- End Attribute Check Fix ---
 
         # 3. Build Close Instruction
         logger.info(f"Account {account_to_close} exists with zero balance. Proceeding with closure.")
@@ -84,34 +98,33 @@ async def close_account_if_exists(
             account=account_to_close,
             dest=wallet.pubkey, # Send reclaimed SOL to wallet owner
             owner=wallet.pubkey,
-            program_id=SolanaProgramAddresses.TOKEN_PROGRAM_ID # Use correct constant
+            program_id=TOKEN_PROGRAM_ID # Use the imported constant
         )
         ix = close_account(close_params)
 
         # 4. Send Transaction using the helper function
         logger.info(f"Sending transaction to close ATA: {account_to_close}")
-        # Pass the async client TO the helper function if it needs it,
-        # OR modify the helper if it only needs the RPC endpoint URL.
-        # Assuming build_and_send_transaction uses the client passed to it.
-        # Need to wrap the async client if build_and_send expects our SolanaClient wrapper
-        # For simplicity, let's assume build_and_send can use the AsyncClient directly for now
-        # OR modify build_and_send to accept AsyncClient. Let's assume it needs the wrapper:
-        # temp_solana_client_wrapper = SolanaClient(RPC_ENDPOINT) # Temporary wrapper if needed by helper
-        # temp_solana_client_wrapper._async_client = async_client # Inject async client
-
+        # Assuming build_and_send_transaction expects the AsyncClient directly
+        # or modify the helper function signature / create a temporary wrapper if needed
         tx_result = await build_and_send_transaction(
-            # client=temp_solana_client_wrapper, # Pass wrapper if needed by helper
-            client=async_client, # Pass AsyncClient directly if helper accepts it
+            client=async_client, # Pass AsyncClient directly
             payer=wallet.payer, # Pass the Keypair for signing
             instructions=[ix],
             label=f"CloseATA_{str(mint)[:5]}",
-            confirm_commitment="confirmed" # Ensure confirmation
+            confirm_commitment="confirmed" # Pass commitment level
         )
 
-        if tx_result.success:
+        # 5. Process result from helper
+        if tx_result.success and tx_result.signature:
+            logger.info(f"Close transaction sent: {tx_result.signature}. Confirming...")
+            # Confirmation logic might already be in build_and_send_transaction
+            # If not, add confirmation loop here using async_client.confirm_transaction
+            # Assuming the helper already confirmed or confirmation isn't strictly needed for this example script
             logger.info(f"Closed successfully: {account_to_close}. Tx: {tx_result.signature}")
+        elif tx_result.success and not tx_result.signature:
+             logger.warning(f"Close transaction reported success but no signature returned for {account_to_close}.")
         else:
-            logger.error(f"Failed to close account {account_to_close}: {tx_result.error_message}")
+            logger.error(f"Failed to close account {account_to_close}: Type={tx_result.error_type}, Msg={tx_result.error_message}")
 
         return tx_result
 
@@ -124,15 +137,13 @@ async def close_account_if_exists(
 
 
 async def main():
-    global logger
-    try: from src.utils.logger import get_logger; logger = get_logger(__name__)
-    except ImportError: import logging; logging.basicConfig(level=logging.INFO); logger = logging.getLogger(__name__)
+    logger = get_logger(__name__) # Ensure logger is available
 
     if not RPC_ENDPOINT or not PRIVATE_KEY:
-        logger.critical("Error: SOLANA_NODE_RPC_ENDPOINT and SOLANA_PRIVATE_KEY must be set in environment/.env")
+        logger.critical("Error: SOLANA_NODE_RPC_ENDPOINT and SOLANA_PRIVATE_KEY must be set.")
         return
-    if "EXAMPLE_MINT" in MINT_ADDRESS_TO_CLOSE_STR or "9WHpYbq" in MINT_ADDRESS_TO_CLOSE_STR: # Check if placeholder is still there
-         logger.critical("Error: Please update MINT_ADDRESS_TO_CLOSE_STR in the script with the actual mint address of the ATA you want to close.")
+    if MINT_ADDRESS_TO_CLOSE_STR == "EXAMPLE_MINT_ADDRESS_REPLACE_ME":
+         logger.critical("Error: Please update MINT_ADDRESS_TO_CLOSE_STR in the script.")
          return
 
     try:
@@ -144,21 +155,23 @@ async def main():
         ata_to_close = Wallet.get_associated_token_address(wallet.pubkey, mint_to_close)
         logger.info(f"Derived ATA address: {ata_to_close}")
 
-        async with AsyncClient(RPC_ENDPOINT) as client: # Use standard async client context
+        # Use standard AsyncClient context manager
+        async with AsyncClient(RPC_ENDPOINT) as client:
              result = await close_account_if_exists(client, wallet, ata_to_close, mint_to_close)
-             logger.info(f"Closure attempt result: Success={result.success}, Message={result.error_message}, Signature={result.signature}")
+             logger.info(f"Closure attempt result: Success={result.success}, Message={result.error_message or 'N/A'}, Signature={result.signature or 'N/A'}")
 
     except ValueError as e: logger.error(f"Error: Invalid address format - {str(e)}")
     except Exception as e: logger.error(f"Unexpected error in main: {e}", exc_info=True)
 
 
 if __name__ == "__main__":
-    # Load .env for standalone execution
     print("Loading .env variables for cleanup script...")
-    load_dotenv()
+    # Load .env from project root when run standalone
+    dotenv_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', '.env')
+    load_dotenv(dotenv_path=dotenv_path)
     RPC_ENDPOINT = os.getenv("SOLANA_NODE_RPC_ENDPOINT")
     PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY")
-    # MINT_ADDRESS_TO_CLOSE_STR = os.getenv("MINT_TO_CLOSE", MINT_ADDRESS_TO_CLOSE_STR) # Optionally override via env
+    # MINT_ADDRESS_TO_CLOSE_STR = os.getenv("MINT_TO_CLOSE", MINT_ADDRESS_TO_CLOSE_STR)
 
     try: asyncio.run(main())
     except KeyboardInterrupt: print("\nOperation cancelled.")

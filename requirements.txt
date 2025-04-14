@@ -1,0 +1,10 @@
+solana>=0.34.0 # Specify version found or higher compatible
+solders>=0.21.0 # Specify version found or higher compatible
+base58
+PyNaCl
+borsh-construct>=0.1.0 # Or specific version if known
+python-dotenv
+nest-asyncio
+solana-keypair
+solana-publickey
+# Add any other direct dependencies you know are needed
