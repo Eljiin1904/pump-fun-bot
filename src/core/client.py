@@ -1,187 +1,243 @@
 # src/core/client.py
 
 import asyncio
-from typing import Optional, Any, List
+import logging
+from typing import Optional, Any, List, Union, Tuple
 
 from solana.rpc.api import Client as SolanaSyncClient
 from solana.rpc.async_api import AsyncClient as SolanaAsyncClient
-from solana.rpc.commitment import Commitment, Confirmed
+# Import CommitmentLevel and CommitmentConfig
+from solders.commitment_config import CommitmentLevel, CommitmentConfig
+# Keep Commitment for type hinting if used elsewhere
+from solana.rpc.commitment import Commitment
 from solana.rpc.types import TxOpts
-# Correct import for response type classes used by the underlying client
-from solders.rpc.responses import GetTokenAccountBalanceResp, GetTokenSupplyResp, GetAccountInfoResp, GetLatestBlockhashResp
-# Import the main RPC exception type
+
+from solders.rpc.responses import (
+    GetTokenAccountBalanceResp, GetTokenSupplyResp, GetAccountInfoResp,
+    GetLatestBlockhashResp, SimulateTransactionResp
+)
 from solana.exceptions import SolanaRpcException
-# InvalidParamsMessage cannot be caught directly as it doesn't inherit BaseException
-# from solders.rpc.errors import InvalidParamsMessage # REMOVED
 from solders.pubkey import Pubkey
 from solders.signature import Signature
-from solders.transaction_status import TransactionConfirmationStatus, TransactionStatus
+from solders.transaction import VersionedTransaction
+from solders.transaction_status import (
+    TransactionConfirmationStatus,
+    TransactionStatus
+)
 
-# Assuming logger is correctly set up in this path
 from ..utils.logger import get_logger
 
 logger = get_logger(__name__)
 
 DEFAULT_TIMEOUT = 30
+DEFAULT_COMMITMENT = CommitmentLevel.Confirmed # Use CommitmentLevel
+
+# Helper to consistently get CommitmentLevel enum
+def _to_commitment_level(commitment: Any) -> CommitmentLevel:
+    """Converts various representations to CommitmentLevel."""
+    if isinstance(commitment, CommitmentLevel): return commitment
+    if isinstance(commitment, CommitmentConfig): return commitment.commitment # Extract level
+    # Handle string representations
+    name = str(commitment).lower().replace("-", "_")
+    if name == "processed": return CommitmentLevel.Processed
+    if name == "confirmed": return CommitmentLevel.Confirmed
+    if name == "finalized": return CommitmentLevel.Finalized
+    # Handle old TransactionConfirmationStatus enums if necessary
+    if hasattr(commitment, "name"):
+        name = commitment.name.lower()
+        if name == "processed": return CommitmentLevel.Processed
+        if name == "confirmed": return CommitmentLevel.Confirmed
+        if name == "finalized": return CommitmentLevel.Finalized
+    logger.warning(f"Could not map commitment '{commitment}' to CommitmentLevel, using default: {DEFAULT_COMMITMENT}")
+    return DEFAULT_COMMITMENT
+
+# Helper to convert CommitmentLevel to TransactionConfirmationStatus for comparison
+def _level_to_status(level: CommitmentLevel) -> TransactionConfirmationStatus:
+    if level == CommitmentLevel.Processed: return TransactionConfirmationStatus.Processed
+    if level == CommitmentLevel.Confirmed: return TransactionConfirmationStatus.Confirmed
+    if level == CommitmentLevel.Finalized: return TransactionConfirmationStatus.Finalized
+    return TransactionConfirmationStatus.Confirmed # Default fallback
+
 
 class SolanaClient:
     """ Wraps sync and async Solana clients with improved error handling. """
 
     def __init__(self, rpc_endpoint: str, wss_endpoint: Optional[str] = None, timeout: int = DEFAULT_TIMEOUT):
-        """ Initializes the Solana client wrapper. """
         logger.info(f"Initializing SolanaClient with RPC: {rpc_endpoint}")
         self.rpc_endpoint = rpc_endpoint
         self.wss_endpoint = wss_endpoint
         self._timeout = timeout
-        # Pass commitment and timeout if supported by your SyncClient version
-        self._sync_client = SolanaSyncClient(rpc_endpoint, commitment=Confirmed)
-        self._async_client = SolanaAsyncClient(rpc_endpoint, commitment=Confirmed)
-        self._is_connected = False # For async context manager tracking
+        # Store the default CommitmentLevel
+        self.default_commitment_level = DEFAULT_COMMITMENT
+        # Initialize underlying clients with CommitmentConfig
+        self._sync_client = SolanaSyncClient(rpc_endpoint, commitment=CommitmentConfig(self.default_commitment_level))
+        self._async_client = SolanaAsyncClient(rpc_endpoint, commitment=CommitmentConfig(self.default_commitment_level))
 
-    def get_async_client(self) -> SolanaAsyncClient:
-        """Returns the initialized async client instance."""
-        return self._async_client
+    def get_async_client(self) -> SolanaAsyncClient: return self._async_client
+    def get_sync_client(self) -> SolanaSyncClient: return self._sync_client
 
-    def get_sync_client(self) -> SolanaSyncClient:
-         """Returns the initialized sync client instance."""
-         return self._sync_client
-
-    async def __aenter__(self):
-        """Enter asynchronous context."""
-        self._is_connected = True
-        logger.debug(f"Async Solana client context potentially managed for {self.rpc_endpoint}")
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        """Exit asynchronous context and close connections."""
-        logger.debug("Closing async Solana client connection (if applicable)...")
-        # Use robust closing logic
+    # ... __aenter__, __aexit__, close ...
+    async def __aenter__(self): return self
+    async def __aexit__(self, exc_type, exc_val, exc_tb): await self.close()
+    async def close(self):
+        logger.debug("Closing async Solana client connection...")
         close_method = getattr(self._async_client, 'aclose', getattr(self._async_client, 'close', None))
         if close_method and asyncio.iscoroutinefunction(close_method):
             try: await close_method()
             except Exception as e: logger.error(f"Error closing async client: {e}")
         elif close_method:
-             try: close_method()
-             except Exception as e: logger.error(f"Error closing async client (sync close): {e}")
-        self._is_connected = False
+            try: close_method()
+            except Exception as e: logger.error(f"Error closing async client (sync close): {e}")
         logger.debug("Async Solana client connection closed.")
 
-    async def get_account_info( self, pubkey: Pubkey, commitment: Optional[Commitment] = None, encoding: str = "base64" ) -> Optional[Any]:
-        """ Fetches account info, returning the 'value' part or None on error. """
-        method_name = "get_account_info" # For logging
-        try:
-            used_commitment = commitment or self._async_client.commitment
-            resp: GetAccountInfoResp = await self._async_client.get_account_info( pubkey, commitment=used_commitment, encoding=encoding )
-            # Check hasattr before returning value
-            if hasattr(resp, 'value'):
-                return resp.value
-            else:
-                logger.error(f"{method_name} response for {pubkey} lacks 'value' attribute. Response: {resp}")
-                return None
-        except SolanaRpcException as e_rpc:
-            logger.error(f"RPC Exception {method_name} {pubkey}: {e_rpc}")
-            if isinstance(e_rpc.__cause__, Exception): logger.error(f"  Underlying cause: {type(e_rpc.__cause__).__name__}: {e_rpc.__cause__}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected Error {method_name} {pubkey}: Type={type(e)}, Error={e}", exc_info=True)
-            return None
+    # --- Methods requiring CommitmentLevel passed to underlying client ---
 
-    async def get_token_account_balance( self, pubkey: Pubkey, commitment: Optional[Commitment] = None ) -> Optional[Any]:
-        """
-        Fetches token balance response. Returns the 'value' part of the response
-        (which contains amount, decimals, uiAmountString) or None on error.
-        """
+    async def get_account_info(self, pubkey: Pubkey, commitment: Optional[Any] = None, encoding: str = "base64") -> Optional[Any]:
+        method_name = "get_account_info"
+        try:
+            # <<< FIX: Convert input commitment to CommitmentLevel enum for the call >>>
+            level_to_use = _to_commitment_level(commitment or self.default_commitment_level)
+            logger.debug(f"{method_name} using commitment level: {level_to_use}")
+            resp: GetAccountInfoResp = await self._async_client.get_account_info(
+                pubkey,
+                commitment=level_to_use, # Pass the CommitmentLevel enum
+                encoding=encoding
+            )
+            if hasattr(resp, 'value'): return resp.value
+            else: logger.error(f"{method_name} response for {pubkey} lacks 'value'. Response: {resp}"); return None
+        except KeyError as e: # Catch potential KeyErrors from internal commitment mapping
+             logger.error(f"Internal KeyError in {method_name} ({pubkey}) with commitment '{commitment}': {e}. Check solana-py version/compatibility.", exc_info=True); return None
+        except SolanaRpcException as e_rpc: logger.error(f"RPC Exception {method_name} {pubkey}: {e_rpc}"); return None
+        except Exception as e: logger.error(f"Unexpected Error {method_name} {pubkey}: {e}", exc_info=True); return None
+
+    async def get_token_account_balance(self, pubkey: Pubkey, commitment: Optional[Any] = None) -> Optional[Any]:
         method_name = "get_token_account_balance"
         try:
-            used_commitment = commitment or self._async_client.commitment
-            resp: GetTokenAccountBalanceResp = await self._async_client.get_token_account_balance( pubkey, commitment=used_commitment )
-            # Check hasattr before returning value
-            if hasattr(resp, 'value'):
-                return resp.value
-            else:
-                logger.error(f"{method_name} response for {pubkey} lacks 'value' attribute. Response: {resp}")
-                return None
+            # <<< FIX: Convert input commitment to CommitmentLevel enum for the call >>>
+            level_to_use = _to_commitment_level(commitment or self.default_commitment_level)
+            logger.debug(f"{method_name} using commitment level: {level_to_use}")
+            resp: GetTokenAccountBalanceResp = await self._async_client.get_token_account_balance(
+                pubkey,
+                commitment=level_to_use # Pass the CommitmentLevel enum
+            )
+            if hasattr(resp, 'value'): return resp.value
+            elif resp and hasattr(resp, 'message') and "could not find account" in resp.message.lower(): logger.debug(f"Token account {pubkey} not found."); return None
+            else: logger.error(f"{method_name} response for {pubkey} lacks 'value' or structure. Response: {resp}"); return None
+        except KeyError as e: logger.error(f"Internal KeyError in {method_name} ({pubkey}) with commitment '{commitment}': {e}.", exc_info=True); return None
         except SolanaRpcException as e_rpc:
-            logger.error(f"RPC Exception {method_name} {pubkey}: {e_rpc}")
-            if isinstance(e_rpc.__cause__, Exception): logger.error(f"  Underlying cause: {type(e_rpc.__cause__).__name__}: {e_rpc.__cause__}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected Error {method_name} {pubkey}: Type={type(e)}, Error={e}", exc_info=True)
-            return None
+            if "could not find account" in str(e_rpc).lower(): logger.debug(f"Token account {pubkey} not found via RPC Exception."); return None
+            logger.error(f"RPC Exception {method_name} {pubkey}: {e_rpc}"); return None
+        except Exception as e: logger.error(f"Unexpected Error {method_name} {pubkey}: {e}", exc_info=True); return None
 
-    async def get_token_supply( self, pubkey: Pubkey, commitment: Optional[Commitment] = None ) -> Optional[Any]:
-        """
-        Fetches token supply response. Returns the 'value' part of the response
-        (which contains amount, decimals, uiAmountString) or None on error.
-        """
+    async def get_token_supply(self, pubkey: Pubkey, commitment: Optional[Any] = None) -> Optional[Any]:
         method_name = "get_token_supply"
         try:
-            used_commitment = commitment or self._async_client.commitment
-            resp: GetTokenSupplyResp = await self._async_client.get_token_supply( pubkey, commitment=used_commitment )
-            # Check hasattr before returning value
-            if hasattr(resp, 'value'):
-                return resp.value
-            else:
-                logger.error(f"{method_name} response for {pubkey} lacks 'value' attribute. Response: {resp}")
-                return None
-        except SolanaRpcException as e_rpc:
-            logger.error(f"RPC Exception {method_name} {pubkey}: {e_rpc}")
-            if isinstance(e_rpc.__cause__, Exception): logger.error(f"  Underlying cause: {type(e_rpc.__cause__).__name__}: {e_rpc.__cause__}")
-            return None
-        except Exception as e:
-            logger.error(f"Unexpected Error {method_name} {pubkey}: Type={type(e)}, Error={e}", exc_info=True)
-            return None
+            # <<< FIX: Convert input commitment to CommitmentLevel enum for the call >>>
+            level_to_use = _to_commitment_level(commitment or self.default_commitment_level)
+            logger.debug(f"{method_name} using commitment level: {level_to_use}")
+            resp: GetTokenSupplyResp = await self._async_client.get_token_supply(
+                pubkey,
+                commitment=level_to_use # Pass the CommitmentLevel enum
+            )
+            if hasattr(resp, 'value'): return resp.value
+            else: logger.error(f"{method_name} response for {pubkey} lacks 'value'. Response: {resp}"); return None
+        except KeyError as e: logger.error(f"Internal KeyError in {method_name} ({pubkey}) with commitment '{commitment}': {e}.", exc_info=True); return None
+        except SolanaRpcException as e_rpc: logger.error(f"RPC Exception {method_name} {pubkey}: {e_rpc}"); return None
+        except Exception as e: logger.error(f"Unexpected Error {method_name} {pubkey}: {e}", exc_info=True); return None
 
-    async def get_latest_blockhash( self, commitment: Optional[Commitment] = None ) -> Optional[GetLatestBlockhashResp]:
-        """ Fetches latest blockhash response, returning response object or None on error. """
+    async def get_latest_blockhash(self, commitment: Optional[Any] = None) -> Optional[GetLatestBlockhashResp]:
         method_name = "get_latest_blockhash"
         try:
-            used_commitment = commitment or self._async_client.commitment or Confirmed
-            resp: GetLatestBlockhashResp = await self._async_client.get_latest_blockhash(commitment=used_commitment)
-            # Return the whole response object if value exists
-            if hasattr(resp, 'value'):
-                 return resp
-            else:
-                 logger.error(f"{method_name} response lacks 'value' attribute. Response: {resp}")
-                 return None
-        except SolanaRpcException as e_rpc:
-             logger.error(f"RPC Exception {method_name}: {e_rpc}")
-             if isinstance(e_rpc.__cause__, Exception): logger.error(f"  Underlying cause: {type(e_rpc.__cause__).__name__}: {e_rpc.__cause__}")
-             return None
-        except Exception as e:
-            logger.error(f"Unexpected Error {method_name}: Type={type(e)}, Error={e}", exc_info=True)
-            return None
+             # <<< FIX: Convert input commitment to CommitmentLevel enum for the call >>>
+            level_to_use = _to_commitment_level(commitment or self.default_commitment_level)
+            logger.debug(f"{method_name} using commitment level: {level_to_use}")
+            resp: GetLatestBlockhashResp = await self._async_client.get_latest_blockhash(
+                commitment=level_to_use # Pass the CommitmentLevel enum
+            )
+            if hasattr(resp, 'value'): return resp
+            else: logger.error(f"{method_name} response lacks 'value'. Response: {resp}"); return None
+        except KeyError as e: logger.error(f"Internal KeyError in {method_name} with commitment '{commitment}': {e}.", exc_info=True); return None
+        except SolanaRpcException as e_rpc: logger.error(f"RPC Exception {method_name}: {e_rpc}"); return None
+        except Exception as e: logger.error(f"Unexpected Error {method_name}: {e}", exc_info=True); return None
 
-    async def send_transaction( self, tx: Any, opts: TxOpts ) -> Optional[Signature]:
-        """ Sends a transaction, returning the signature or raises on error. """
+    # --- Methods where CommitmentLevel seems handled correctly by library ---
+
+    async def send_transaction(self, tx: VersionedTransaction, opts: TxOpts) -> Optional[Signature]:
         method_name = "send_transaction"
         try:
-            signature: Signature = await self._async_client.send_transaction(tx, opts=opts)
+            # TxOpts uses CommitmentLevel directly, which seems correct based on previous fix.
+            # Ensure get_default_send_options provides the correct CommitmentLevel in opts.
+            logger.debug(f"Sending transaction with options: SkipPreflight={opts.skip_preflight}, PreflightCommitment={opts.preflight_commitment}")
+            signature_resp = await self._async_client.send_transaction(tx, opts=opts)
+            signature = signature_resp.signature
+            logger.debug(f"Transaction sent. Signature: {signature}")
             return signature
-        except SolanaRpcException as e_rpc:
-             logger.error(f"RPC Exception {method_name}: {e_rpc}", exc_info=True)
-             raise # Re-raise send errors
-        except Exception as e:
-            logger.error(f"Unexpected Error {method_name}: Type={type(e)}, Error={e}", exc_info=True)
-            raise
+        except SolanaRpcException as e_rpc: logger.error(f"RPC Exception {method_name}: {e_rpc}", exc_info=True); return None
+        except Exception as e: logger.error(f"Unexpected Error {method_name}: {e}", exc_info=True); return None
 
-    async def confirm_transaction( self, signature: Signature, commitment: Optional[Commitment] = None, timeout_secs: int = 60, sleep_secs: float = 1.0 ) -> Optional[TransactionConfirmationStatus]:
-        """ Polls for transaction confirmation status using get_signature_statuses. """
-        used_commitment = commitment or self._async_client.commitment or Confirmed; logger.debug(f"Confirming {signature} with {used_commitment} (timeout {timeout_secs}s)"); start_time = asyncio.get_event_loop().time();
+    async def confirm_transaction(self, signature: Signature, commitment: Optional[Any] = None, timeout_secs: int = 60, sleep_secs: float = 1.0) -> Optional[TransactionConfirmationStatus]:
+        # Convert target to CommitmentLevel first
+        target_commitment_level = _to_commitment_level(commitment or self.default_commitment_level)
+        # Convert to TransactionConfirmationStatus for comparison >=
+        target_conf_status = _level_to_status(target_commitment_level)
+
+        logger.debug(f"Confirming {signature} with target status {target_conf_status} (derived from {target_commitment_level}, timeout {timeout_secs}s)")
+        start_time = asyncio.get_event_loop().time()
         while (asyncio.get_event_loop().time() - start_time) < timeout_secs:
             try:
-                status_resp: List[Optional[TransactionStatus]] = await self._async_client.get_signature_statuses([signature])
-                if status_resp and status_resp[0] is not None:
-                    tx_status: TransactionStatus = status_resp[0]; current_conf_status = getattr(tx_status, 'confirmation_status', None); tx_err = getattr(tx_status, 'err', None); logger.debug(f"Sig {signature} status: {current_conf_status}, Err: {tx_err}");
-                    if tx_err: logger.warning(f"Transaction {signature} failed confirmation with error: {tx_err}"); return None
-                    if current_conf_status and current_conf_status >= used_commitment: logger.info(f"Transaction {signature} reached commitment {used_commitment}."); return current_conf_status
-                elif status_resp and status_resp[0] is None: logger.debug(f"Signature {signature} not found yet. Polling...")
-                else: logger.error(f"Unexpected status response structure for {signature}: {status_resp}")
-            except SolanaRpcException as e_rpc: logger.error(f"RPC Exception polling status {signature}: {e_rpc}") # Catch RPC errors during polling
-            except Exception as e_stat: logger.error(f"Unexpected Error fetching status {signature}: Type={type(e_stat)}, Error={e_stat}", exc_info=False)
-            await asyncio.sleep(sleep_secs);
-        logger.warning(f"Confirm timeout for {signature} after {timeout_secs}s."); return None
+                # <<< FIX: Pass CommitmentLevel to get_signature_statuses >>>
+                # Note: get_signature_statuses expects CommitmentConfig, so wrap the level
+                status_resp = await self._async_client.get_signature_statuses(
+                    [signature],
+                    commitment=CommitmentConfig(target_commitment_level) # Wrap level here
+                )
+                if status_resp and status_resp.value and status_resp.value[0] is not None:
+                    tx_status: TransactionStatus = status_resp.value[0]
+                    current_conf_status = getattr(tx_status, 'confirmation_status', None)
+                    tx_err = getattr(tx_status, 'err', None)
+                    if tx_err: logger.warning(f"Transaction {signature} confirmed but FAILED: {tx_err}"); return None
+                    # Compare using TransactionConfirmationStatus enums
+                    if current_conf_status and current_conf_status >= target_conf_status:
+                        logger.info(f"Transaction {signature} reached commitment {current_conf_status} (>= target {target_conf_status}).")
+                        return current_conf_status
+                # else: logger.debug(f"Polling {signature}: Status not yet available or None.")
+            except SolanaRpcException as e_rpc: logger.error(f"RPC Exception polling status {signature}: {e_rpc}")
+            except Exception as e_stat: logger.error(f"Unexpected Error fetching status {signature}: {e_stat}", exc_info=False)
+            await asyncio.sleep(sleep_secs)
+        logger.warning(f"Confirm timeout for {signature} after {timeout_secs}s.")
+        return None
 
     def get_default_send_options(self, skip_preflight: bool = False) -> TxOpts:
-         """ Returns default TxOpts for sending transactions. """
-         return TxOpts(skip_preflight=skip_preflight, preflight_commitment=self._async_client.commitment or Confirmed)
+        # This already uses CommitmentLevel correctly
+        client_commitment_config = self._async_client.commitment
+        default_level = client_commitment_config.commitment if client_commitment_config else self.default_commitment_level
+        logger.debug(f"Using preflight commitment: {default_level}")
+        return TxOpts(
+            skip_preflight=skip_preflight,
+            preflight_commitment=default_level # Pass the CommitmentLevel enum
+        )
+
+    # Dependent methods - should now work if the underlying get_ methods are fixed
+    async def get_token_balance_lamports(self, pubkey: Pubkey, commitment: Optional[Any] = None) -> Optional[int]:
+        balance_value = await self.get_token_account_balance(pubkey, commitment) # Relies on fixed get_token_account_balance
+        if balance_value and hasattr(balance_value, 'amount'):
+            try: return int(balance_value.amount)
+            except (ValueError, TypeError) as e: logger.error(f"Could not parse token balance amount '{balance_value.amount}' for {pubkey}: {e}"); return None
+        elif balance_value is None: logger.debug(f"get_token_balance_lamports: Account {pubkey} not found or error fetching.")
+        else: logger.warning(f"get_token_balance_lamports: Token balance response value for {pubkey} missing 'amount': {balance_value}")
+        return None
+
+    async def get_token_supply_lamports(self, pubkey: Pubkey, commitment: Optional[Any] = None) -> Optional[int]:
+        supply_value = await self.get_token_supply(pubkey, commitment) # Relies on fixed get_token_supply
+        if supply_value and hasattr(supply_value, 'amount'):
+            try: return int(supply_value.amount)
+            except (ValueError, TypeError) as e: logger.error(f"Could not parse token supply amount '{supply_value.amount}' for {pubkey}: {e}"); return None
+        elif supply_value is None: logger.debug(f"get_token_supply_lamports: Error fetching supply for {pubkey}.")
+        else: logger.warning(f"get_token_supply_lamports: Token supply response value for {pubkey} missing 'amount': {supply_value}")
+        return None
+
+    async def does_token_account_exist(self, pubkey: Pubkey, commitment: Optional[Any] = None) -> bool:
+        acc_info_value = await self.get_account_info(pubkey, commitment=commitment, encoding="base64") # Relies on fixed get_account_info
+        exists = acc_info_value is not None
+        logger.debug(f"Token account {pubkey} exists check: {exists}")
+        return exists
