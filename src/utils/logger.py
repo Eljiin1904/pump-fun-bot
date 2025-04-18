@@ -26,6 +26,7 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
 
     logger = logging.getLogger(name)
     logger.setLevel(level)
+    logger.propagate = False
 
     if not logger.handlers:
         formatter = logging.Formatter(
