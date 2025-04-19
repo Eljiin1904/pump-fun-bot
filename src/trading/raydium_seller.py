@@ -1,100 +1,133 @@
 # src/trading/raydium_seller.py
-
+from typing import Optional
 import asyncio
-from typing import Optional, Any, Dict, List
+import base64
 
-from solders.pubkey import Pubkey
-from solders.compute_budget import set_compute_unit_price, set_compute_unit_limit
-from solders.signature import Signature
-from solders.system_program import ID as SYSTEM_PROGRAM_ID
-WSOL_ADDRESS = Pubkey.from_string("So11111111111111111111111111111111111111112")
-from solders.transaction_status import TransactionConfirmationStatus
-from solana.rpc.commitment import Confirmed
+from solders.transaction import VersionedTransaction
+from solders.message import to_bytes_versioned
+from solana.rpc.core import RPCException
 
-# --- Project Imports ---
+from .base import TokenInfo, TradeResult
 from ..core.client import SolanaClient
-from ..core.priority_fee.manager import PriorityFeeManager
 from ..core.wallet import Wallet
-from ..core.transactions import build_and_send_transaction, TransactionResult
-from ..trading.base import TokenInfo, TradeResult
 from ..utils.logger import get_logger
-# Import Raydium specific tools if available
-try:
-    from ..tools.raydium_amm import RaydiumAMMInfoFetcher, RaydiumSwapWrapper
-    RAYDIUM_TOOLS_ENABLED = True
-except ImportError:
-    try: temp_logger = get_logger(__name__); temp_logger.warning("Raydium tools (AMMInfoFetcher, SwapWrapper) not found. RaydiumSeller will not function.")
-    except: print("WARNING: Raydium components not found, Raydium features disabled (logger not init).")
-    RaydiumAMMInfoFetcher = None
-    RaydiumSwapWrapper = None
-    RAYDIUM_TOOLS_ENABLED = False
+from ..data.raydium_data import get_raydium_pool_data
 
-if 'logger' not in locals(): logger = get_logger(__name__)
+logger = get_logger(__name__)
 
-DEFAULT_COMPUTE_UNIT_LIMIT_RAYDIUM = 600_000
-FETCH_RETRY_DELAY_SECONDS = 4.0
+WSOL_MINT_ADDRESS = "So11111111111111111111111111111111111111112"
+JUPITER_QUOTE_URL = "https://quote-api.jup.ag/v4/quote"
+JUPITER_SWAP_URL = "https://quote-api.jup.ag/v4/swap"
 
 class RaydiumSeller:
-    """ Handles selling tokens on Raydium AMM pools. """
-
-    def __init__(
-        self,
-        client: SolanaClient,
-        wallet: Wallet,
-        priority_fee_manager: PriorityFeeManager,
-        slippage_bps: int,
-        max_retries: int = 3,
-        confirm_timeout: int = 60,
-        compute_unit_limit: int = DEFAULT_COMPUTE_UNIT_LIMIT_RAYDIUM
-    ):
+    def __init__(self, client: SolanaClient, wallet: Wallet, **kwargs):
+        """
+        Handles selling tokens via Raydium (using Jupiter aggregator).
+        """
         self.client = client
         self.wallet = wallet
-        self.priority_fee_manager = priority_fee_manager
-        self.slippage_bps = slippage_bps
-        self.max_retries = max_retries
-        self.confirm_timeout = confirm_timeout
-        self.compute_unit_limit = compute_unit_limit
-        self.amm_fetcher = RaydiumAMMInfoFetcher(client) if RAYDIUM_TOOLS_ENABLED and RaydiumAMMInfoFetcher else None
-        self.swap_wrapper = RaydiumSwapWrapper() if RAYDIUM_TOOLS_ENABLED and RaydiumSwapWrapper else None
-        if not RAYDIUM_TOOLS_ENABLED or not self.amm_fetcher or not self.swap_wrapper: logger.error("RaydiumSeller initialized BUT Raydium tools are missing/disabled. Sell operations will fail.")
-        logger.info(f"RaydiumSeller Init: Slip={self.slippage_bps} BPS, MaxRetries={self.max_retries}, CULimit={self.compute_unit_limit}")
+        self.sell_slippage_bps: int = kwargs.get("sell_slippage_bps", 2500)  # e.g. 2500 = 25%
+        self.max_retries: int = kwargs.get("max_retries", 2)
+        self.confirm_timeout: int = kwargs.get("confirm_timeout", 60)
+        self.quote_url: str = kwargs.get("quote_url", JUPITER_QUOTE_URL)
+        self.swap_url: str = kwargs.get("swap_url", JUPITER_SWAP_URL)
 
-    async def execute(self, token_info: TokenInfo, amount_in_lamports: int) -> TradeResult:
-        """ Attempts to sell the specified amount of tokens on Raydium. """
-        mint_str = str(token_info.mint); logger.info(f"Attempting Raydium sell for {token_info.symbol} ({mint_str[:6]} - {amount_in_lamports} lamports)...")
-        if not self.amm_fetcher or not self.swap_wrapper: logger.error(f"Raydium Sell {token_info.symbol}: Tools not available."); return TradeResult(success=False, error_message="Raydium tools not available/enabled.")
-        user_pubkey = self.wallet.pubkey; mint_pubkey = token_info.mint
-        retry_count = 0; error_message = "Max Raydium sell retries reached"
-        while retry_count < self.max_retries:
-            retry_count += 1; logger.info(f"Raydium sell attempt {retry_count}/{self.max_retries} for {token_info.symbol}")
+    async def execute(self, token_info: TokenInfo, amount_to_sell_lamports: int) -> TradeResult:
+        """
+        Execute selling the given token amount (in lamports) via Raydium/Jupiter.
+        Returns TradeResult with success status and tx signature if successful.
+        """
+        mint_address = str(token_info.mint)
+        params = {
+            "inputMint": mint_address,
+            "outputMint": WSOL_MINT_ADDRESS,
+            "amount": str(amount_to_sell_lamports),
+            "slippageBps": str(self.sell_slippage_bps),
+            "onlyDirectRoutes": "true"
+        }
+        last_error = ""
+        for attempt in range(1, self.max_retries + 1):
             try:
-                pool_info: Optional[Dict[str, Any]] = await self.amm_fetcher.get_pool_info_for_token(str(mint_pubkey))
-                if not pool_info or 'amm_id' not in pool_info: logger.warning(f"Raydium Sell: No AMM pool found for {token_info.symbol} ({mint_str}). Cannot sell on Raydium."); error_message = "No Raydium pool found for token"; break
-                amm_id = Pubkey.from_string(pool_info['amm_id']); logger.debug(f"Found Raydium Pool: {amm_id}")
-                compute_unit_price_micro_lamports = 0
+                # Allow broader routing on retry
+                if attempt > 1:
+                    params["onlyDirectRoutes"] = "false"
+                    logger.info(f"No direct pool route for {token_info.symbol}, trying Jupiter aggregator...")
+                # Get quote from Jupiter API
+                import httpx
+                async with httpx.AsyncClient() as http_client:
+                    quote_resp = await http_client.get(self.quote_url, params=params)
+                quote_data = quote_resp.json() if quote_resp.status_code == 200 else None
+                if not quote_data or "data" not in quote_data or len(quote_data["data"]) == 0:
+                    last_error = "No swap route available"
+                    logger.warning(f"No swap route found for {token_info.symbol} (attempt {attempt}).")
+                    continue
+                route_info = quote_data["data"][0]
+                # Request swap transaction from Jupiter
+                swap_request = {
+                    "route": route_info,
+                    "userPublicKey": str(self.wallet.pubkey),
+                    "wrapUnwrapSOL": True
+                }
+                async with httpx.AsyncClient() as http_client:
+                    swap_resp = await http_client.post(self.swap_url, json=swap_request)
+                if swap_resp.status_code != 200:
+                    swap_resp.raise_for_status()
+                swap_data = swap_resp.json()
+                if "swapTransaction" not in swap_data:
+                    last_error = swap_data.get("error", "Unknown swap error")
+                    logger.error(f"Jupiter swap API returned error for {token_info.symbol}: {last_error}")
+                    continue
+                # Decode and sign the swap transaction
+                tx_bytes = base64.b64decode(swap_data["swapTransaction"])
+                transaction = VersionedTransaction.from_bytes(tx_bytes)
                 try:
-                    # *** FIX: Call correct method ***
-                    fee_accounts: List[Pubkey] = [amm_id]
-                    fee = await self.priority_fee_manager.calculate_priority_fee(accounts=fee_accounts)
-                    if fee is not None: compute_unit_price_micro_lamports = fee; logger.info(f"Using priority fee for Raydium sell: {compute_unit_price_micro_lamports} micro-lamports")
-                    else: logger.info("Priority Fee Manager returned None for Raydium sell. Using 0.")
-                except AttributeError: logger.error("PriorityFeeManager missing 'calculate_priority_fee' method. Using 0 fee.")
-                except Exception as fee_e: logger.error(f"Error calculating priority fee for Raydium sell: {fee_e}. Using 0.", exc_info=True)
-                swap_instructions: Optional[List[Any]] = None
+                    sig = self.wallet.payer.sign_message(to_bytes_versioned(transaction.message))
+                    sig_list = list(transaction.signatures)
+                    if not sig_list:
+                        sig_list = [sig]
+                    else:
+                        sig_list[0] = sig
+                    transaction.signatures = sig_list
+                except Exception as e:
+                    last_error = f"Failed to sign swap transaction: {e}"
+                    logger.error(last_error)
+                    continue
+                # Send the signed transaction
                 try:
-                    input_token_mint = mint_pubkey; output_token_mint = WSOL_ADDRESS
-                    swap_instructions = await self.swap_wrapper.build_swap_instructions( pool_info=pool_info, input_mint=input_token_mint, output_mint=output_token_mint, amount_in=amount_in_lamports, slippage_bps=self.slippage_bps, owner_pubkey=user_pubkey )
-                    if not swap_instructions: logger.error(f"Raydium Sell: Failed to build swap instructions for {token_info.symbol}."); error_message = "Failed to build Raydium swap instructions"; await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS); continue
-                except Exception as build_e: logger.error(f"Error building Raydium swap instructions for {token_info.symbol}: {build_e}", exc_info=True); error_message = f"Build swap instruction error: {build_e}"; await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS); continue
-                instructions: List[Any] = [set_compute_unit_limit(self.compute_unit_limit), set_compute_unit_price(int(compute_unit_price_micro_lamports)), *swap_instructions]
-                tx_result: TransactionResult = await build_and_send_transaction( client=self.client, payer=self.wallet.payer, instructions=instructions, label=f"Sell_Raydium_{token_info.symbol[:5]}" )
-                if tx_result.success and tx_result.signature:
-                    logger.info(f"Raydium Sell tx sent: {tx_result.signature}. Confirming..."); signature_obj = Signature.from_string(tx_result.signature); confirmation_status = await self.client.confirm_transaction( signature_obj, timeout_secs=self.confirm_timeout, commitment=TransactionConfirmationStatus.Confirmed ); status_str = str(confirmation_status) if confirmation_status else "Timeout/Failed"; is_confirmed = confirmation_status is not None and confirmation_status >= TransactionConfirmationStatus.Confirmed
-                    if is_confirmed: logger.info(f"Raydium Sell tx CONFIRMED: {tx_result.signature}"); return TradeResult( success=True, tx_signature=tx_result.signature, price=None, amount=None )
-                    else: error_message = f"Raydium Sell tx {tx_result.signature} confirmation failed. Status: {status_str}"; logger.warning(error_message); await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS); continue
-                elif tx_result.error_type: error_message = f"Raydium Sell tx failed ({tx_result.error_type}): {tx_result.error_message or 'No specific message'}"; logger.warning(f"{error_message}. Retrying..."); await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS + 1); continue
-                else: error_message = "Raydium Sell tx send failed with unknown error."; logger.error(error_message); await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS + 1); continue
-            except Exception as e: error_message = f"Unexpected error during Raydium sell attempt {retry_count}: {e}"; logger.error(error_message, exc_info=True);
-            if "No Raydium pool found" in error_message: break
-            await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS + 3)
-        logger.error(f"Failed Raydium sell {token_info.symbol} after {self.max_retries} attempts: {error_message}"); return TradeResult(success=False, error_message=error_message, amount=0.0, price=0.0)
+                    tx_signature = await self.client.async_client.send_raw_transaction(bytes(transaction), opts={"skip_preflight": True, "max_retries": 3})
+                except Exception as send_err:
+                    last_error = f"Transaction send failed: {send_err}"
+                    logger.warning(last_error)
+                    continue
+                # Confirm transaction
+                confirmed = False
+                for _ in range(self.confirm_timeout):
+                    status_resp = await self.client.async_client.get_signature_statuses([tx_signature])
+                    if status_resp.value and status_resp.value[0] and status_resp.value[0].confirmation_status in ("confirmed", "finalized"):
+                        confirmed = True
+                        break
+                    await asyncio.sleep(1)
+                if not confirmed:
+                    last_error = f"Swap transaction {tx_signature} not confirmed in time"
+                    logger.warning(last_error)
+                    continue
+                logger.info(f"Swap transaction confirmed: {tx_signature}")
+                # Estimate price and amount from quote data (if available)
+                price_per_token = None
+                token_amount = None
+                try:
+                    in_amt = float(route_info.get("inAmount")) if route_info.get("inAmount") else None
+                    out_amt = float(route_info.get("outAmount")) if route_info.get("outAmount") else None
+                    if in_amt and out_amt:
+                        price_per_token = (out_amt / 1e9) / (in_amt / 1e9)
+                        token_amount = in_amt / 1e9
+                except Exception:
+                    price_per_token = None
+                return TradeResult(success=True, tx_signature=tx_signature, price=price_per_token, amount=token_amount)
+            except Exception as e:
+                last_error = f"Unexpected error during Raydium sell: {e}"
+                logger.error(last_error, exc_info=True)
+                await asyncio.sleep(2)
+                continue
+        logger.error(f"Failed to sell {token_info.symbol} on Raydium after {self.max_retries} attempts: {last_error}")
+        return TradeResult(success=False, error_message=last_error)

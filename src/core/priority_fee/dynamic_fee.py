@@ -1,123 +1,88 @@
 import asyncio
 import statistics
-from typing import Optional, List, Any, Sequence, Dict
+import logging
+from typing import List, Optional, Any
+from httpx import AsyncClient
 
-from solders.pubkey import Pubkey
-from solana.rpc.async_api import AsyncClient
-from solana.rpc.commitment import Commitment, Confirmed
-from solana.exceptions import SolanaRpcException
-from . import PriorityFeePlugin
-from ...utils.logger import get_logger  # Adjust path if needed
+logger = logging.getLogger(__name__)
 
-logger = get_logger(__name__)
+FEE_FETCH_MAX_RETRIES = 3
+FEE_FETCH_DELAY = 0.5  # seconds
 
-PRIORITY_FEE_FETCH_MAX_RETRIES = 3
-PRIORITY_FEE_FETCH_DELAY = 0.5
-DEFAULT_PRIORITY_FEE_PERCENTILE = 75
-
-
-class DynamicPriorityFee(PriorityFeePlugin):
-    """ Dynamic priority fee plugin using getRecentPrioritizationFees RPC. """
-
-    def __init__(
-        self,
-        client: AsyncClient,
-        target_accounts: Optional[Sequence[Pubkey]] = None,
-        commitment: Commitment = Confirmed,
-        percentile: int = DEFAULT_PRIORITY_FEE_PERCENTILE,
-    ):
-        if not 0 <= percentile <= 100:
-            raise ValueError("Percentile must be between 0 and 100")
-
-        self.client = client
-        self.default_target_accounts = list(target_accounts) if target_accounts else []
-        self.commitment = commitment
-        self.percentile = percentile
+class DynamicPriorityFee:
+    """Dynamic priority fee plugin using get_recent_prioritization_fees."""
+    def __init__(self, client):
+        """ Initialize the dynamic fee plugin. """
+        self.client = client  # Expecting the raw solana-py AsyncClient
         self.last_dynamic_fee: Optional[int] = None
 
-    async def get_priority_fee(
-        self,
-        accounts: Optional[Sequence[Pubkey]] = None,
-    ) -> Optional[int]:
-        """Fetches recent prioritization fees and calculates a dynamic fee."""
-        accounts_to_query = (
-            [str(a) for a in accounts]
-            if accounts is not None
-            else [str(a) for a in self.default_target_accounts]
-        )
-        desc = "passed-in" if accounts is not None else "default"
-
-        for attempt in range(1, PRIORITY_FEE_FETCH_MAX_RETRIES + 1):
+    async def get_priority_fee(self, accounts: Optional[List] = None) -> Optional[int]:
+        """Fetch dynamic priority fee. Returns median fee or last known fee if errors."""
+        account_list: List[str] = [str(acc) for acc in accounts[:128]] if accounts else []
+        last_error: Optional[Exception] = None
+        for attempt in range(FEE_FETCH_MAX_RETRIES):
             try:
-                logger.debug(
-                    f"Fetching prioritization fees (Attempt {attempt}/{PRIORITY_FEE_FETCH_MAX_RETRIES}), "
-                    f"{desc} accounts: {accounts_to_query or ['Global']}, commitment: {self.commitment}"
-                )
-
-                # High-level method if implemented
-                if hasattr(self.client, 'get_recent_prioritization_fees'):
-                    resp = await self.client.get_recent_prioritization_fees(
-                        locked_writable_accounts=accounts_to_query,
-                        commitment=self.commitment,
-                    )
-                    raw = getattr(resp, 'value', None)
+                logger.debug(f"Fetching priority fees (Attempt {attempt+1}/{FEE_FETCH_MAX_RETRIES}). Accounts: {account_list}")
+                # Attempt to call solana-py AsyncClient method if available
+                if hasattr(self.client, "get_recent_prioritization_fees"):
+                    response = await self.client.get_recent_prioritization_fees(account_list)
+                    fees_data = response.value if hasattr(response, 'value') else response  # solders response might have .value
                 else:
-                    # Raw RPC fallback
-                    params: Any = [accounts_to_query]
-                    params.append({"commitment": self.commitment})
-                    raw_resp: Dict[str, Any] = await self.client._provider.make_request(
-                        "getRecentPrioritizationFees", params
-                    )
-                    result = raw_resp.get('result', raw_resp)
-                    raw = result.get('value', result)
-
-                if not isinstance(raw, list):
-                    raise ValueError(f"Unexpected fees payload: {raw!r}")
-
-                # Parse fees
-                fees = [int(getattr(entry, 'prioritization_fee', entry)) for entry in raw if entry is not None]
-                fees.sort()
+                    # Fallback: direct RPC request via HTTP
+                    body = {
+                        "jsonrpc": "2.0",
+                        "id": 1,
+                        "method": "getRecentPrioritizationFees",
+                        "params": [account_list]
+                    }
+                    async with AsyncClient(timeout=5.0) as http_client:
+                        resp = await http_client.post(self.client._provider.endpoint_uri, json=body)
+                        resp.raise_for_status()
+                        json_data = resp.json()
+                    result = json_data.get("result")
+                    if result is None:
+                        raise Exception(f"RPC returned no result: {json_data}")
+                    fees_data = result
+                # Process fees_data (expected list of fee info dicts or objects)
+                if not fees_data:
+                    logger.warning(f"No prioritization fee data returned on attempt {attempt+1}.")
+                    if attempt < FEE_FETCH_MAX_RETRIES - 1:
+                        await asyncio.sleep(FEE_FETCH_DELAY * (attempt + 1))
+                        continue
+                    else:
+                        return self.last_dynamic_fee or 0
+                fees = []
+                for fee_info in fees_data:
+                    # fee_info could be dict or object
+                    if isinstance(fee_info, dict):
+                        fee_val = fee_info.get("prioritizationFee")
+                    else:
+                        fee_val = getattr(fee_info, 'prioritization_fee', None) or getattr(fee_info, 'prioritizationFee', None)
+                    if fee_val is not None:
+                        try:
+                            fees.append(int(fee_val))
+                        except (ValueError, TypeError):
+                            logger.warning(f"Invalid fee value format: {fee_val}")
                 if not fees:
-                    raise ValueError("No valid fees after parsing")
-
-                # Select percentile index
-                idx = min(int(len(fees) * self.percentile / 100), len(fees) - 1)
-                fee_value = fees[idx]
-
-                logger.debug(
-                    f"Fees samples={len(fees)} min={fees[0]} max={fees[-1]} median={statistics.median(fees)}"
-                )
-                logger.info(
-                    f"Calculated dynamic priority fee ({self.percentile}th percentile): {fee_value}"
-                )
-
-                self.last_dynamic_fee = fee_value
-                return fee_value
-
-            except (AttributeError, ValueError) as err:
-                logger.error(
-                    f"Error fetching prioritization fees (Attempt {attempt}): {err}",
-                    exc_info=True
-                )
-                return self.last_dynamic_fee
-
-            except SolanaRpcException as rpc_err:
-                logger.error(
-                    f"RPC exception fetching prioritization fees (Attempt {attempt}): {rpc_err}"
-                )
-
+                    logger.warning(f"No valid fee values on attempt {attempt+1}.")
+                    if attempt < FEE_FETCH_MAX_RETRIES - 1:
+                        await asyncio.sleep(FEE_FETCH_DELAY * (attempt + 1))
+                        continue
+                    else:
+                        return self.last_dynamic_fee or 0
+                # Take median of collected fees
+                priority_fee = int(statistics.median(fees))
+                logger.debug(f"Calculated median priority fee: {priority_fee} microLamports from {len(fees)} samples.")
+                self.last_dynamic_fee = priority_fee
+                return priority_fee
             except Exception as e:
-                logger.error(
-                    f"Unexpected error (Attempt {attempt}): {e}",
-                    exc_info=True
-                )
-
-            # Delay before retry
-            if attempt < PRIORITY_FEE_FETCH_MAX_RETRIES:
-                await asyncio.sleep(PRIORITY_FEE_FETCH_DELAY)
-
-        logger.error(
-            f"Failed to fetch priority fees after {PRIORITY_FEE_FETCH_MAX_RETRIES} attempts, "
-            f"returning last known fee: {self.last_dynamic_fee}"
-        )
-        return self.last_dynamic_fee
+                last_error = e
+                # If method is unsupported, break and fallback to 0
+                if isinstance(e, AttributeError) and "get_recent_prioritization_fees" in str(e):
+                    logger.error("AsyncClient has no get_recent_prioritization_fees method. Falling back to 0 priority fee.")
+                    break
+                logger.error(f"Error fetching priority fee (Attempt {attempt+1}): {e}")
+                if attempt < FEE_FETCH_MAX_RETRIES - 1:
+                    await asyncio.sleep(FEE_FETCH_DELAY * (attempt + 1))
+        logger.error(f"Failed to fetch priority fee after {FEE_FETCH_MAX_RETRIES} attempts. Last error: {last_error}")
+        return self.last_dynamic_fee or 0
