@@ -1,0 +1,225 @@
+<html>
+<head>
+<title>README.md</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #bcbec4;}
+.s1 { color: #bcbec4;}
+.s2 { color: #56a8f5;}
+.s3 { color: #cf8e6d;}
+.s4 { color: #c77dbb; font-style: italic;}
+.s5 { color: #6aab73;}
+.ln { color: #4b5059; font-weight: normal; font-style: normal; }
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+README.md</font>
+</center></td></tr></table>
+<pre><a name="l1"><span class="ln">1    </span></a><span class="s0">**&gt;&gt;</span><span class="s1">WARNNING ON SCAMS IN ISSUES COMMENT SECTION</span><span class="s0">&lt;&lt;**</span>
+<a name="l2"><span class="ln">2    </span></a>
+<a name="l3"><span class="ln">3    </span></a><span class="s1">The issues comment section is often targeted by scam bots willing to redirect you to an external resource and drain your funds.</span>
+<a name="l4"><span class="ln">4    </span></a>
+<a name="l5"><span class="ln">5    </span></a><span class="s1">I have enabled a GitHub actions script to detect the common patterns and tag them, which obviously is not 100% accurate.</span>
+<a name="l6"><span class="ln">6    </span></a>
+<a name="l7"><span class="ln">7    </span></a><span class="s1">This is also why you will see deleted comments in the issues—I only delete the scam bot comments targeting your private keys.</span>
+<a name="l8"><span class="ln">8    </span></a>
+<a name="l9"><span class="ln">9    </span></a><span class="s1">The official maintainers are in the </span><span class="s0">[</span><span class="s1">MAINTAINERS.md</span><span class="s0">](</span><span class="s1">MAINTAINERS.md</span><span class="s0">) </span><span class="s1">file.</span>
+<a name="l10"><span class="ln">10   </span></a>
+<a name="l11"><span class="ln">11   </span></a><span class="s1">Not everyone is a scammer though, sometimes there are helpful outside devs who comment and I absolutely appreciate it.</span>
+<a name="l12"><span class="ln">12   </span></a>
+<a name="l13"><span class="ln">13   </span></a><span class="s0">**&gt;&gt;</span><span class="s1">END OF WARNING</span><span class="s0">&lt;&lt;**</span>
+<a name="l14"><span class="ln">14   </span></a>
+<a name="l15"><span class="ln">15   </span></a><span class="s1">Development ongoing in the </span><span class="s0">[</span><span class="s1">refactored/main-v2</span><span class="s0">](</span><span class="s2">https://github.com/chainstacklabs/pump-fun-bot/commits/refactored/main-v2/</span><span class="s0">) </span><span class="s1">branch.</span>
+<a name="l16"><span class="ln">16   </span></a>
+<a name="l17"><span class="ln">17   </span></a><span class="s1">As of March 21, 2025, the bot from the </span><span class="s0">**</span><span class="s1">refactored/main-v2</span><span class="s0">** </span><span class="s1">branch is signficantly better over the </span><span class="s0">**</span><span class="s1">main</span><span class="s0">** </span><span class="s1">version, so the suggestion is to FAFO with v2.</span>
+<a name="l18"><span class="ln">18   </span></a>
+<a name="l19"><span class="ln">19   </span></a><span class="s1">Leave your feedback by opening </span><span class="s0">**</span><span class="s1">Issues</span><span class="s0">**</span><span class="s1">.</span>
+<a name="l20"><span class="ln">20   </span></a>
+<a name="l21"><span class="ln">21   </span></a><span class="s1">A word warning</span><span class="s0">:</span>
+<a name="l22"><span class="ln">22   </span></a>
+<a name="l23"><span class="ln">23   </span></a><span class="s0">**</span><span class="s1">Not For Production </span><span class="s0">(</span><span class="s1">NFP</span><span class="s0">)**</span>
+<a name="l24"><span class="ln">24   </span></a>
+<a name="l25"><span class="ln">25   </span></a><span class="s1">This code is not intended for production use. Feel free to take the source, modify it to your needs, and most importantly, </span><span class="s0">**</span><span class="s1">learn from it</span><span class="s0">**</span><span class="s1">.</span>
+<a name="l26"><span class="ln">26   </span></a>
+<a name="l27"><span class="ln">27   </span></a><span class="s1">We assume no responsibility for the code or its usage. This is our public service contribution to the community and Web3.</span>
+<a name="l28"><span class="ln">28   </span></a>
+<a name="l29"><span class="ln">29   </span></a><span class="s3"># </span><span class="s1">Pump.fun bot development roadmap</span>
+<a name="l30"><span class="ln">30   </span></a>
+<a name="l31"><span class="ln">31   </span></a><span class="s3">| </span><span class="s0">Stage </span><span class="s3">| </span><span class="s0">Feature </span><span class="s3">| </span><span class="s0">Comments </span><span class="s3">| </span><span class="s0">Implementation status</span>
+<a name="l32"><span class="ln">32   </span></a><span class="s3">|-------|---------|----------|---------------------|</span>
+<a name="l33"><span class="ln">33   </span></a><span class="s3">| </span><span class="s0">**Stage 1: General updates &amp; QoL** </span><span class="s3">| </span><span class="s0">Lib updates </span><span class="s3">| </span><span class="s0">Updating to the latest libraries </span><span class="s3">| </span><span class="s0">✅ </span><span class="s3">|</span>
+<a name="l34"><span class="ln">34   </span></a><span class="s3">| | </span><span class="s0">Error handling </span><span class="s3">| </span><span class="s0">Improving error handling </span><span class="s3">| </span><span class="s0">WIP </span><span class="s3">| </span>
+<a name="l35"><span class="ln">35   </span></a><span class="s3">| | </span><span class="s0">Configurable RPS </span><span class="s3">| </span><span class="s0">Ability to set RPS in the config to match your provider's and plan RPS (preferably [Chainstack](https://console.chainstack.com/) 🤩) </span><span class="s3">| </span><span class="s0">WIP </span><span class="s3">|</span>
+<a name="l36"><span class="ln">36   </span></a><span class="s3">| | </span><span class="s0">Dynamic priority fees </span><span class="s3">| </span><span class="s0">Ability to set dynamic priority fees </span><span class="s3">| </span><span class="s0">✅ </span><span class="s3">|</span>
+<a name="l37"><span class="ln">37   </span></a><span class="s3">| </span><span class="s0">**Stage 2: Bonding curve and migration management** </span><span class="s3">| </span><span class="s0">`logsSubscribe` integration </span><span class="s3">| </span><span class="s0">Integrate `logsSubscribe` instead of `blockSubscribe` for sniping minted tokens into the main bot </span><span class="s3">| </span><span class="s0">✅ </span><span class="s3">|</span>
+<a name="l38"><span class="ln">38   </span></a><span class="s3">| | </span><span class="s0">Dual subscription methods </span><span class="s3">| </span><span class="s0">Keep both `logsSubscribe` &amp; `blockSubscribe` in the main bot for flexibility and adapting to Solana node architecture changes </span><span class="s3">| </span><span class="s0">✅ </span><span class="s3">|</span>
+<a name="l39"><span class="ln">39   </span></a><span class="s3">| | </span><span class="s0">Transaction retries </span><span class="s3">| </span><span class="s0">Do retries instead of cooldown and/or keep the cooldown </span><span class="s3">| </span><span class="s0">WIP </span><span class="s3">|</span>
+<a name="l40"><span class="ln">40   </span></a><span class="s3">| | </span><span class="s0">Bonding curve status tracking </span><span class="s3">| </span><span class="s0">Checking a bonding curve status progress. Predict how soon a token will start the migration process </span><span class="s3">| </span><span class="s0">WIP </span><span class="s3">| </span>
+<a name="l41"><span class="ln">41   </span></a><span class="s3">| | </span><span class="s0">Account closure script </span><span class="s3">| </span><span class="s0">Script to close the associated bonding curve account if the rest of the flow txs fails </span><span class="s3">| </span><span class="s0">✅ </span><span class="s3">|</span>
+<a name="l42"><span class="ln">42   </span></a><span class="s3">| | </span><span class="s0">PumpSwap migration listening </span><span class="s3">| </span><span class="s0">pump_fun migrated to their own DEX — [PumpSwap](https://x.com/pumpdotfun/status/1902762309950292010), so we need to FAFO with that instead of Raydium (and attempt `logSubscribe` implementation) </span><span class="s3">| </span><span class="s0">FAFO </span><span class="s3">|</span>
+<a name="l43"><span class="ln">43   </span></a><span class="s3">| </span><span class="s0">**Stage 3: Trading experience** </span><span class="s3">| </span><span class="s0">Take profit/stop loss </span><span class="s3">| </span><span class="s0">Implement take profit, stop loss exit strategies </span><span class="s3">| </span><span class="s0">FAFO </span><span class="s3">|</span>
+<a name="l44"><span class="ln">44   </span></a><span class="s3">| | </span><span class="s0">Market cap-based selling </span><span class="s3">| </span><span class="s0">Sell when a specific market cap has been reached </span><span class="s3">| </span><span class="s0">Not started </span><span class="s3">|</span>
+<a name="l45"><span class="ln">45   </span></a><span class="s3">| | </span><span class="s0">Copy trading </span><span class="s3">| </span><span class="s0">Enable copy trading functionality </span><span class="s3">| </span><span class="s0">Not started </span><span class="s3">|</span>
+<a name="l46"><span class="ln">46   </span></a><span class="s3">| | </span><span class="s0">Token analysis script </span><span class="s3">| </span><span class="s0">Script for basic token analysis (market cap, creator investment, liquidity, token age) </span><span class="s3">| </span><span class="s0">Not started </span><span class="s3">|</span>
+<a name="l47"><span class="ln">47   </span></a><span class="s3">| | </span><span class="s0">Archive node integration </span><span class="s3">| </span><span class="s0">Use Solana archive nodes for historical analysis (accounts that consistently print tokens, average mint to raydium time) </span><span class="s3">| </span><span class="s0">Not started </span><span class="s3">|</span>
+<a name="l48"><span class="ln">48   </span></a><span class="s3">| | </span><span class="s0">Geyser implementation </span><span class="s3">| </span><span class="s0">Leverage Solana Geyser for real-time data stream processing </span><span class="s3">| </span><span class="s0">Not started </span><span class="s3">|</span>
+<a name="l49"><span class="ln">49   </span></a><span class="s3">| </span><span class="s0">**Stage 4: Minting experience** </span><span class="s3">| </span><span class="s0">Token minting </span><span class="s3">| </span><span class="s0">Ability to mint tokens (based on user request - someone minted 18k tokens) </span><span class="s3">| </span><span class="s0">FAFO </span><span class="s3">|</span>
+<a name="l50"><span class="ln">50   </span></a>
+<a name="l51"><span class="ln">51   </span></a>
+<a name="l52"><span class="ln">52   </span></a><span class="s3">## </span><span class="s1">Development Timeline</span>
+<a name="l53"><span class="ln">53   </span></a><span class="s3">- </span><span class="s1">Development begins</span><span class="s0">: </span><span class="s1">Week of March 10, 2025</span>
+<a name="l54"><span class="ln">54   </span></a><span class="s3">- </span><span class="s1">Implementation approach</span><span class="s0">: </span><span class="s1">Gradual rollout in separate branch</span>
+<a name="l55"><span class="ln">55   </span></a><span class="s3">- </span><span class="s1">Priority</span><span class="s0">: </span><span class="s1">Stages progress from simple to complex features</span>
+<a name="l56"><span class="ln">56   </span></a><span class="s3">- </span><span class="s1">Completion guarantee</span><span class="s0">: </span><span class="s1">Full completion of Stage 1, other stages dependent on feedback and feasibility</span>
+<a name="l57"><span class="ln">57   </span></a>
+<a name="l58"><span class="ln">58   </span></a><span class="s1">For the full walkthrough, see </span><span class="s0">[</span><span class="s1">Solana</span><span class="s0">: </span><span class="s1">Creating a trading and sniping pump.fun bot</span><span class="s0">](</span><span class="s2">https://docs.chainstack.com/docs/solana-creating-a-pumpfun-bot</span><span class="s0">)</span><span class="s1">.</span>
+<a name="l59"><span class="ln">59   </span></a>
+<a name="l60"><span class="ln">60   </span></a><span class="s1">For near-instantaneous transaction propagation, you can use the </span><span class="s0">[</span><span class="s1">Chainstack Solana Trader nodes</span><span class="s0">](</span><span class="s2">https://docs.chainstack.com/docs/trader-nodes</span><span class="s0">)</span><span class="s1">.</span>
+<a name="l61"><span class="ln">61   </span></a>
+<a name="l62"><span class="ln">62   </span></a><span class="s0">[</span><span class="s1">Sign up with Chainstack</span><span class="s0">](</span><span class="s2">https://console.chainstack.com</span><span class="s0">)</span><span class="s1">.</span>
+<a name="l63"><span class="ln">63   </span></a>
+<a name="l64"><span class="ln">64   </span></a>
+<a name="l65"><span class="ln">65   </span></a><span class="s3">## </span><span class="s1">🚀 Getting started</span>
+<a name="l66"><span class="ln">66   </span></a>
+<a name="l67"><span class="ln">67   </span></a><span class="s3">### </span><span class="s1">Prerequisites</span>
+<a name="l68"><span class="ln">68   </span></a><span class="s3">- </span><span class="s1">Install </span><span class="s0">[</span><span class="s1">uv</span><span class="s0">](</span><span class="s2">https://github.com/astral-sh/uv</span><span class="s0">)</span><span class="s1">, a fast Python package manager.</span>
+<a name="l69"><span class="ln">69   </span></a>
+<a name="l70"><span class="ln">70   </span></a><span class="s3">&gt; </span><span class="s1">If Python is already installed, `uv` will detect and use it automatically.</span>
+<a name="l71"><span class="ln">71   </span></a>
+<a name="l72"><span class="ln">72   </span></a><span class="s3">### </span><span class="s1">Installation</span>
+<a name="l73"><span class="ln">73   </span></a>
+<a name="l74"><span class="ln">74   </span></a><span class="s3">#### </span><span class="s1">1️⃣ Install Python </span><span class="s0">(</span><span class="s1">if needed</span><span class="s0">)</span>
+<a name="l75"><span class="ln">75   </span></a><span class="s3">```</span><span class="s4">bash</span>
+<a name="l76"><span class="ln">76   </span></a><span class="s5">uv python install</span>
+<a name="l77"><span class="ln">77   </span></a><span class="s3">```</span>
+<a name="l78"><span class="ln">78   </span></a><span class="s3">&gt; </span><span class="s0">**</span><span class="s1">Why?</span><span class="s0">** </span><span class="s1">`uv` will fetch and install the required Python version for your system.</span>
+<a name="l79"><span class="ln">79   </span></a>
+<a name="l80"><span class="ln">80   </span></a><span class="s3">#### </span><span class="s1">2️⃣ Clone the repository</span>
+<a name="l81"><span class="ln">81   </span></a><span class="s3">```</span><span class="s4">bash</span>
+<a name="l82"><span class="ln">82   </span></a><span class="s5">git clone https://github.com/chainstacklabs/pump-fun-bot.git</span>
+<a name="l83"><span class="ln">83   </span></a><span class="s5">cd pump-fun-bot</span>
+<a name="l84"><span class="ln">84   </span></a><span class="s3">```</span>
+<a name="l85"><span class="ln">85   </span></a>
+<a name="l86"><span class="ln">86   </span></a><span class="s3">#### </span><span class="s1">3️⃣ Set up a virtual environment</span>
+<a name="l87"><span class="ln">87   </span></a><span class="s3">```</span><span class="s4">bash</span>
+<a name="l88"><span class="ln">88   </span></a><span class="s5"># Create virtual environment</span>
+<a name="l89"><span class="ln">89   </span></a><span class="s5">uv venv</span>
+<a name="l90"><span class="ln">90   </span></a>
+<a name="l91"><span class="ln">91   </span></a><span class="s5"># Activate (Unix/macOS)</span>
+<a name="l92"><span class="ln">92   </span></a><span class="s5">source .venv/bin/activate  </span>
+<a name="l93"><span class="ln">93   </span></a>
+<a name="l94"><span class="ln">94   </span></a><span class="s5"># Activate (Windows)</span>
+<a name="l95"><span class="ln">95   </span></a><span class="s5">.venv\Scripts\activate</span>
+<a name="l96"><span class="ln">96   </span></a><span class="s3">```</span>
+<a name="l97"><span class="ln">97   </span></a><span class="s3">&gt; </span><span class="s1">Virtual environments help keep dependencies isolated and prevent conflicts.</span>
+<a name="l98"><span class="ln">98   </span></a>
+<a name="l99"><span class="ln">99   </span></a><span class="s3">#### </span><span class="s1">4️⃣ Install dependencies</span>
+<a name="l100"><span class="ln">100  </span></a><span class="s3">```</span><span class="s4">bash</span>
+<a name="l101"><span class="ln">101  </span></a><span class="s5">uv pip install -e .</span>
+<a name="l102"><span class="ln">102  </span></a><span class="s3">```</span>
+<a name="l103"><span class="ln">103  </span></a><span class="s3">&gt; </span><span class="s0">**</span><span class="s1">Why `-e` </span><span class="s0">(</span><span class="s1">editable mode</span><span class="s0">)</span><span class="s1">?</span><span class="s0">** </span><span class="s1">Lets you modify the code without reinstalling the package—useful for development</span><span class="s0">!</span>
+<a name="l104"><span class="ln">104  </span></a>
+<a name="l105"><span class="ln">105  </span></a><span class="s3">#### </span><span class="s1">5️⃣ Configure the bot</span>
+<a name="l106"><span class="ln">106  </span></a><span class="s3">```</span><span class="s4">bash</span>
+<a name="l107"><span class="ln">107  </span></a><span class="s5"># Copy example config</span>
+<a name="l108"><span class="ln">108  </span></a><span class="s5">cp .env.example .env  # Unix/macOS</span>
+<a name="l109"><span class="ln">109  </span></a>
+<a name="l110"><span class="ln">110  </span></a><span class="s5"># Windows</span>
+<a name="l111"><span class="ln">111  </span></a><span class="s5">copy .env.example .env</span>
+<a name="l112"><span class="ln">112  </span></a><span class="s3">```</span>
+<a name="l113"><span class="ln">113  </span></a><span class="s1">Edit the `.env` file and add your </span><span class="s0">**</span><span class="s1">Solana RPC endpoints</span><span class="s0">** </span><span class="s1">and </span><span class="s0">**</span><span class="s1">private key</span><span class="s0">**</span><span class="s1">.</span>
+<a name="l114"><span class="ln">114  </span></a>
+<a name="l115"><span class="ln">115  </span></a><span class="s3">### </span><span class="s1">Running the bot</span>
+<a name="l116"><span class="ln">116  </span></a>
+<a name="l117"><span class="ln">117  </span></a><span class="s3">```</span><span class="s4">bash</span>
+<a name="l118"><span class="ln">118  </span></a><span class="s5"># Option 1: run as installed package</span>
+<a name="l119"><span class="ln">119  </span></a><span class="s5">pump_bot --help</span>
+<a name="l120"><span class="ln">120  </span></a>
+<a name="l121"><span class="ln">121  </span></a><span class="s5"># Option 2: run directly</span>
+<a name="l122"><span class="ln">122  </span></a><span class="s5">python -m src.cli --help</span>
+<a name="l123"><span class="ln">123  </span></a><span class="s3">```</span>
+<a name="l124"><span class="ln">124  </span></a>
+<a name="l125"><span class="ln">125  </span></a><span class="s3">&gt; </span><span class="s0">**</span><span class="s1">You're all set</span><span class="s0">! </span><span class="s1">🎉</span><span class="s0">**  </span><span class="s1">Now you can start using the bot. Check `--help` for available commands. 🚀</span>
+<a name="l126"><span class="ln">126  </span></a>
+<a name="l127"><span class="ln">127  </span></a><span class="s3">## </span><span class="s1">Note on limits</span>
+<a name="l128"><span class="ln">128  </span></a>
+<a name="l129"><span class="ln">129  </span></a><span class="s1">Solana is an amazing piece of web3 architecture, but it's also very complex to maintain.</span>
+<a name="l130"><span class="ln">130  </span></a>
+<a name="l131"><span class="ln">131  </span></a><span class="s1">Chainstack is daily </span><span class="s0">(</span><span class="s1">literally, including weekends</span><span class="s0">) </span><span class="s1">working on optimizing our Solana infrastructure to make it the best in the industry.</span>
+<a name="l132"><span class="ln">132  </span></a>
+<a name="l133"><span class="ln">133  </span></a><span class="s1">That said, all node providers have their own setup recommendations &amp; limits, like method availability, requests per second </span><span class="s0">(</span><span class="s1">RPS</span><span class="s0">)</span><span class="s1">, free and paid plan specific limitations and so on.</span>
+<a name="l134"><span class="ln">134  </span></a>
+<a name="l135"><span class="ln">135  </span></a><span class="s1">So please make sure you consult the docs of the node provider you are going to use for the bot here. And obviously the public RPC nodes won't work for the heavier use case scenarios like this bot.</span>
+<a name="l136"><span class="ln">136  </span></a>
+<a name="l137"><span class="ln">137  </span></a><span class="s1">For Chainstack, all of the details and limits you need to be aware of are consolidated here</span><span class="s0">: [</span><span class="s1">Limits</span><span class="s0">](</span><span class="s2">https://docs.chainstack.com/docs/limits</span><span class="s0">) &lt;</span><span class="s1">— we are </span><span class="s0">_</span><span class="s1">always</span><span class="s0">_ </span><span class="s1">keeping this piece up to date so you can rely on it.</span>
+<a name="l138"><span class="ln">138  </span></a>
+<a name="l139"><span class="ln">139  </span></a><span class="s3">## </span><span class="s1">Changelog</span>
+<a name="l140"><span class="ln">140  </span></a>
+<a name="l141"><span class="ln">141  </span></a><span class="s1">Quick note on a couple on a few new scripts in `/learning-examples`</span><span class="s0">:</span>
+<a name="l142"><span class="ln">142  </span></a>
+<a name="l143"><span class="ln">143  </span></a><span class="s0">*(</span><span class="s1">this is basically a changelog now</span><span class="s0">)*</span>
+<a name="l144"><span class="ln">144  </span></a>
+<a name="l145"><span class="ln">145  </span></a><span class="s1">Also, here's a quick doc</span><span class="s0">: [</span><span class="s1">Listening to pump.fun migrations to Raydium</span><span class="s0">](</span><span class="s2">https://docs.chainstack.com/docs/solana-listening-to-pumpfun-migrations-to-raydium</span><span class="s0">)</span>
+<a name="l146"><span class="ln">146  </span></a>
+<a name="l147"><span class="ln">147  </span></a><span class="s3">## </span><span class="s1">Bonding curve state check</span>
+<a name="l148"><span class="ln">148  </span></a>
+<a name="l149"><span class="ln">149  </span></a><span class="s1">`check_boding_curve_status.py` — checks the state of the bonding curve associated with a token. When the bonding curve state is completed, the token is migrated to Raydium.</span>
+<a name="l150"><span class="ln">150  </span></a>
+<a name="l151"><span class="ln">151  </span></a><span class="s1">To run</span><span class="s0">:</span>
+<a name="l152"><span class="ln">152  </span></a>
+<a name="l153"><span class="ln">153  </span></a><span class="s1">`python check_boding_curve_status.py TOKEN_ADDRESS`</span>
+<a name="l154"><span class="ln">154  </span></a>
+<a name="l155"><span class="ln">155  </span></a><span class="s3">## </span><span class="s1">Listening to the Raydium migration</span>
+<a name="l156"><span class="ln">156  </span></a>
+<a name="l157"><span class="ln">157  </span></a><span class="s1">When the bonding curve state completes, the liquidity and the token graduate to Raydium.</span>
+<a name="l158"><span class="ln">158  </span></a>
+<a name="l159"><span class="ln">159  </span></a><span class="s1">`listen_to_raydium_migration.py` — listens to the migration events of the tokens from pump_fun to Raydium and prints the signature of the migration, the token address, and the liquidity pool address on Raydium.</span>
+<a name="l160"><span class="ln">160  </span></a>
+<a name="l161"><span class="ln">161  </span></a><span class="s1">Note that it's using the </span><span class="s0">[</span><span class="s1">blockSubscribe</span><span class="s0">]([</span><span class="s1">url</span><span class="s0">](</span><span class="s2">https://docs.chainstack.com/reference/blocksubscribe-solana</span><span class="s0">)) </span><span class="s1">method that not all providers support, but Chainstack does and I </span><span class="s0">(</span><span class="s1">although obviously biased</span><span class="s0">) </span><span class="s1">found it pretty reliable.</span>
+<a name="l162"><span class="ln">162  </span></a>
+<a name="l163"><span class="ln">163  </span></a><span class="s1">To run</span><span class="s0">:</span>
+<a name="l164"><span class="ln">164  </span></a>
+<a name="l165"><span class="ln">165  </span></a><span class="s1">`python listen_to_raydium_migration.py`</span>
+<a name="l166"><span class="ln">166  </span></a>
+<a name="l167"><span class="ln">167  </span></a><span class="s0">**</span><span class="s1">The following two new additions are based on this question </span><span class="s0">[</span><span class="s1">associatedBondingCurve #26</span><span class="s0">](</span><span class="s2">https://github.com/chainstacklabs/pump-fun-bot/issues/26</span><span class="s0">)**</span>
+<a name="l168"><span class="ln">168  </span></a>
+<a name="l169"><span class="ln">169  </span></a><span class="s1">You can take the compute the associatedBondingCurve address following the </span><span class="s0">[</span><span class="s1">Solana docs PDA</span><span class="s0">](</span><span class="s2">https://solana.com/docs/core/pda</span><span class="s0">) </span><span class="s1">description logic. Take the following as input </span><span class="s0">*</span><span class="s1">as seed</span><span class="s0">* (</span><span class="s1">order seems to matter</span><span class="s0">):</span>
+<a name="l170"><span class="ln">170  </span></a>
+<a name="l171"><span class="ln">171  </span></a><span class="s3">- </span><span class="s1">bondingCurve address</span>
+<a name="l172"><span class="ln">172  </span></a><span class="s3">- </span><span class="s1">the Solana system token program address</span><span class="s0">: </span><span class="s1">`TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA`</span>
+<a name="l173"><span class="ln">173  </span></a><span class="s3">- </span><span class="s1">the token mint address</span>
+<a name="l174"><span class="ln">174  </span></a>
+<a name="l175"><span class="ln">175  </span></a><span class="s1">And compute against the Solana system associated token account program address</span><span class="s0">: </span><span class="s1">`ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL`.</span>
+<a name="l176"><span class="ln">176  </span></a>
+<a name="l177"><span class="ln">177  </span></a><span class="s1">The implications of this are kinda huge</span><span class="s0">:</span>
+<a name="l178"><span class="ln">178  </span></a><span class="s3">* </span><span class="s1">you can now use `logsSubscribe` to snipe the tokens and you are not limited to the `blockSubscribe` method</span>
+<a name="l179"><span class="ln">179  </span></a><span class="s3">* </span><span class="s1">see which one is faster</span>
+<a name="l180"><span class="ln">180  </span></a><span class="s3">* </span><span class="s1">not every provider supports `blockSubscribe` on lower tier plans or at all, but everyone supports `logsSubscribe`</span>
+<a name="l181"><span class="ln">181  </span></a>
+<a name="l182"><span class="ln">182  </span></a><span class="s1">The following script showcase the implementation.</span>
+<a name="l183"><span class="ln">183  </span></a>
+<a name="l184"><span class="ln">184  </span></a><span class="s3">## </span><span class="s1">Compute associated bonding curve</span>
+<a name="l185"><span class="ln">185  </span></a>
+<a name="l186"><span class="ln">186  </span></a><span class="s1">`compute_associated_bonding_curve.py` — computes the associated bonding curve for a given token.    </span>
+<a name="l187"><span class="ln">187  </span></a>
+<a name="l188"><span class="ln">188  </span></a><span class="s1">To run</span><span class="s0">:</span>
+<a name="l189"><span class="ln">189  </span></a>
+<a name="l190"><span class="ln">190  </span></a><span class="s1">`python compute_associated_bonding_curve.py` and then enter the token mint address.</span>
+<a name="l191"><span class="ln">191  </span></a>
+<a name="l192"><span class="ln">192  </span></a><span class="s3">## </span><span class="s1">Listen to new direct full details</span>
+<a name="l193"><span class="ln">193  </span></a>
+<a name="l194"><span class="ln">194  </span></a><span class="s1">`listen_new_direct_full_details.py` — listens to the new direct full details events and prints the signature, the token address, the user, the bonding curve address, and the associated bonding curve address using just the `logsSubscribe` method. Basically everything you need for sniping using just `logsSubscribe` and no extra calls like doing `getTransaction` to get the missing data. It's just computed on the fly now.</span>
+<a name="l195"><span class="ln">195  </span></a>
+<a name="l196"><span class="ln">196  </span></a><span class="s1">To run</span><span class="s0">:</span>
+<a name="l197"><span class="ln">197  </span></a>
+<a name="l198"><span class="ln">198  </span></a><span class="s1">`python listen_new_direct_full_details.py`</span>
+<a name="l199"><span class="ln">199  </span></a>
+<a name="l200"><span class="ln">200  </span></a><span class="s1">So now you can run `listen_create_from_blocksubscribe.py` and `listen_new_direct_full_details.py` at the same time and see which one is faster.</span>
+<a name="l201"><span class="ln">201  </span></a>
+<a name="l202"><span class="ln">202  </span></a><span class="s1">Also here's a doc on this</span><span class="s0">: [</span><span class="s1">Solana</span><span class="s0">: </span><span class="s1">Listening to pump.fun token mint using only logsSubscribe</span><span class="s0">](</span><span class="s2">https://docs.chainstack.com/docs/solana-listening-to-pumpfun-token-mint-using-only-logssubscribe</span><span class="s0">)</span>
+<a name="l203"><span class="ln">203  </span></a></pre>
+</body>
+</html>

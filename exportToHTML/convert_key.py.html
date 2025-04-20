@@ -1,0 +1,43 @@
+<html>
+<head>
+<title>convert_key.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #7a7e85;}
+.s4 { color: #6aab73;}
+.ln { color: #4b5059; font-weight: normal; font-style: normal; }
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+convert_key.py</font>
+</center></td></tr></table>
+<pre><a name="l1"><span class="ln">1    </span></a><span class="s0">import </span><span class="s1">json</span>
+<a name="l2"><span class="ln">2    </span></a>
+<a name="l3"><span class="ln">3    </span></a><span class="s0">import </span><span class="s1">base58</span>
+<a name="l4"><span class="ln">4    </span></a><span class="s0">from </span><span class="s1">solana</span><span class="s2">.</span><span class="s1">keypair </span><span class="s0">import </span><span class="s1">Keypair</span>
+<a name="l5"><span class="ln">5    </span></a>
+<a name="l6"><span class="ln">6    </span></a><span class="s3"># Update the file path to point to your keypair file.</span>
+<a name="l7"><span class="ln">7    </span></a><span class="s1">KEYPAIR_PATH </span><span class="s2">= </span><span class="s4">&quot;C:/Users/eljin/my_solana_keypair.json&quot;</span>
+<a name="l8"><span class="ln">8    </span></a>
+<a name="l9"><span class="ln">9    </span></a><span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">KEYPAIR_PATH</span><span class="s2">, </span><span class="s4">&quot;r&quot;</span><span class="s2">) </span><span class="s0">as </span><span class="s1">f</span><span class="s2">:</span>
+<a name="l10"><span class="ln">10   </span></a>    <span class="s1">secret </span><span class="s2">= </span><span class="s1">json</span><span class="s2">.</span><span class="s1">load</span><span class="s2">(</span><span class="s1">f</span><span class="s2">)</span>
+<a name="l11"><span class="ln">11   </span></a>
+<a name="l12"><span class="ln">12   </span></a><span class="s3"># Convert the list of integers to bytes.</span>
+<a name="l13"><span class="ln">13   </span></a><span class="s1">secret_bytes </span><span class="s2">= </span><span class="s1">bytes</span><span class="s2">(</span><span class="s1">secret</span><span class="s2">)</span>
+<a name="l14"><span class="ln">14   </span></a>
+<a name="l15"><span class="ln">15   </span></a><span class="s3"># Create a Keypair object.</span>
+<a name="l16"><span class="ln">16   </span></a><span class="s1">keypair </span><span class="s2">= </span><span class="s1">Keypair</span><span class="s2">.</span><span class="s1">from_secret_key</span><span class="s2">(</span><span class="s1">secret_bytes</span><span class="s2">)</span>
+<a name="l17"><span class="ln">17   </span></a>
+<a name="l18"><span class="ln">18   </span></a><span class="s3"># Encode the secret key to a base58 string.</span>
+<a name="l19"><span class="ln">19   </span></a><span class="s1">private_key_b58 </span><span class="s2">= </span><span class="s1">base58</span><span class="s2">.</span><span class="s1">b58encode</span><span class="s2">(</span><span class="s1">keypair</span><span class="s2">.</span><span class="s1">secret_key</span><span class="s2">).</span><span class="s1">decode</span><span class="s2">(</span><span class="s4">&quot;utf-8&quot;</span><span class="s2">)</span>
+<a name="l20"><span class="ln">20   </span></a><span class="s1">print</span><span class="s2">(</span><span class="s4">&quot;Your base58-encoded private key is:&quot;</span><span class="s2">)</span>
+<a name="l21"><span class="ln">21   </span></a><span class="s1">print</span><span class="s2">(</span><span class="s1">private_key_b58</span><span class="s2">)</span>
+<a name="l22"><span class="ln">22   </span></a></pre>
+</body>
+</html>

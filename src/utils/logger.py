@@ -13,7 +13,7 @@ def get_logger(name: str, level: int = logging.INFO) -> logging.Logger:
     """Get or create a logger with the given name.
 
     Args:
-        name: Logger name, typically __name__
+        name: Logger name, typically __name__`
         level: Logging level
 
     Returns:

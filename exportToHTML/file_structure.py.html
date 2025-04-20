@@ -1,0 +1,77 @@
+<html>
+<head>
+<title>file_structure.py</title>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<style type="text/css">
+.s0 { color: #cf8e6d;}
+.s1 { color: #bcbec4;}
+.s2 { color: #bcbec4;}
+.s3 { color: #6aab73;}
+.s4 { color: #7a7e85;}
+.s5 { color: #2aacb8;}
+.ln { color: #4b5059; font-weight: normal; font-style: normal; }
+</style>
+</head>
+<body bgcolor="#1e1f22">
+<table CELLSPACING=0 CELLPADDING=5 COLS=1 WIDTH="100%" BGCOLOR="#606060" >
+<tr><td><center>
+<font face="Arial, Helvetica" color="#000000">
+file_structure.py</font>
+</center></td></tr></table>
+<pre><a name="l1"><span class="ln">1    </span></a><span class="s0">import </span><span class="s1">os</span>
+<a name="l2"><span class="ln">2    </span></a>
+<a name="l3"><span class="ln">3    </span></a><span class="s0">def </span><span class="s1">list_files</span><span class="s2">(</span><span class="s1">startpath</span><span class="s2">, </span><span class="s1">output_file</span><span class="s2">, </span><span class="s1">ignore_dirs</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">ignore_files</span><span class="s2">=</span><span class="s0">None</span><span class="s2">, </span><span class="s1">max_depth</span><span class="s2">=</span><span class="s0">None</span><span class="s2">):</span>
+<a name="l4"><span class="ln">4    </span></a>    <span class="s0">if </span><span class="s1">ignore_dirs </span><span class="s0">is None</span><span class="s2">:</span>
+<a name="l5"><span class="ln">5    </span></a>        <span class="s1">ignore_dirs </span><span class="s2">= {</span><span class="s3">'.git'</span><span class="s2">, </span><span class="s3">'.idea'</span><span class="s2">, </span><span class="s3">'venv'</span><span class="s2">, </span><span class="s3">'__pycache__'</span><span class="s2">, </span><span class="s3">'node_modules'</span><span class="s2">, </span><span class="s3">'.pytest_cache'</span><span class="s2">} </span><span class="s4"># Common things to ignore</span>
+<a name="l6"><span class="ln">6    </span></a>    <span class="s0">if </span><span class="s1">ignore_files </span><span class="s0">is None</span><span class="s2">:</span>
+<a name="l7"><span class="ln">7    </span></a>        <span class="s1">ignore_files </span><span class="s2">= {</span><span class="s3">'.DS_Store'</span><span class="s2">}</span>
+<a name="l8"><span class="ln">8    </span></a>
+<a name="l9"><span class="ln">9    </span></a>    <span class="s0">with </span><span class="s1">open</span><span class="s2">(</span><span class="s1">output_file</span><span class="s2">, </span><span class="s3">'w'</span><span class="s2">, </span><span class="s1">encoding</span><span class="s2">=</span><span class="s3">'utf-8'</span><span class="s2">) </span><span class="s0">as </span><span class="s1">f</span><span class="s2">:</span>
+<a name="l10"><span class="ln">10   </span></a>        <span class="s0">for </span><span class="s1">root</span><span class="s2">, </span><span class="s1">dirs</span><span class="s2">, </span><span class="s1">files </span><span class="s0">in </span><span class="s1">os</span><span class="s2">.</span><span class="s1">walk</span><span class="s2">(</span><span class="s1">startpath</span><span class="s2">, </span><span class="s1">topdown</span><span class="s2">=</span><span class="s0">True</span><span class="s2">):</span>
+<a name="l11"><span class="ln">11   </span></a>            <span class="s4"># --- Calculate depth and apply max_depth ---</span>
+<a name="l12"><span class="ln">12   </span></a>            <span class="s4"># depth = root.replace(startpath, '').count(os.sep) # More reliable way needed if startpath isn't absolute root prefix</span>
+<a name="l13"><span class="ln">13   </span></a>            <span class="s4"># A simpler way based on relative path from startpath:</span>
+<a name="l14"><span class="ln">14   </span></a>            <span class="s1">relative_path </span><span class="s2">= </span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">relpath</span><span class="s2">(</span><span class="s1">root</span><span class="s2">, </span><span class="s1">startpath</span><span class="s2">)</span>
+<a name="l15"><span class="ln">15   </span></a>            <span class="s0">if </span><span class="s1">relative_path </span><span class="s2">== </span><span class="s3">'.'</span><span class="s2">:</span>
+<a name="l16"><span class="ln">16   </span></a>                <span class="s1">depth </span><span class="s2">= </span><span class="s5">0</span>
+<a name="l17"><span class="ln">17   </span></a>            <span class="s0">else</span><span class="s2">:</span>
+<a name="l18"><span class="ln">18   </span></a>                <span class="s1">depth </span><span class="s2">= </span><span class="s1">relative_path</span><span class="s2">.</span><span class="s1">count</span><span class="s2">(</span><span class="s1">os</span><span class="s2">.</span><span class="s1">sep</span><span class="s2">) + </span><span class="s5">1</span>
+<a name="l19"><span class="ln">19   </span></a>
+<a name="l20"><span class="ln">20   </span></a>            <span class="s0">if </span><span class="s1">max_depth </span><span class="s0">is not None and </span><span class="s1">depth </span><span class="s2">&gt; </span><span class="s1">max_depth</span><span class="s2">:</span>
+<a name="l21"><span class="ln">21   </span></a>                <span class="s1">dirs</span><span class="s2">[:] = [] </span><span class="s4"># Don't recurse deeper</span>
+<a name="l22"><span class="ln">22   </span></a>                <span class="s1">files</span><span class="s2">[:] = [] </span><span class="s4"># Don't list files at this level if too deep</span>
+<a name="l23"><span class="ln">23   </span></a>                <span class="s0">continue </span><span class="s4"># Skip processing this directory further</span>
+<a name="l24"><span class="ln">24   </span></a>
+<a name="l25"><span class="ln">25   </span></a>            <span class="s4"># --- Filtering ---</span>
+<a name="l26"><span class="ln">26   </span></a>            <span class="s4"># Filter ignored directories *in place* so os.walk doesn't traverse them</span>
+<a name="l27"><span class="ln">27   </span></a>            <span class="s1">dirs</span><span class="s2">[:] = [</span><span class="s1">d </span><span class="s0">for </span><span class="s1">d </span><span class="s0">in </span><span class="s1">dirs </span><span class="s0">if </span><span class="s1">d </span><span class="s0">not in </span><span class="s1">ignore_dirs</span><span class="s2">]</span>
+<a name="l28"><span class="ln">28   </span></a>            <span class="s4"># Filter ignored files</span>
+<a name="l29"><span class="ln">29   </span></a>            <span class="s1">files </span><span class="s2">= [</span><span class="s1">file </span><span class="s0">for </span><span class="s1">file </span><span class="s0">in </span><span class="s1">files </span><span class="s0">if </span><span class="s1">file </span><span class="s0">not in </span><span class="s1">ignore_files</span><span class="s2">]</span>
+<a name="l30"><span class="ln">30   </span></a>
+<a name="l31"><span class="ln">31   </span></a>
+<a name="l32"><span class="ln">32   </span></a>            <span class="s4"># --- Indentation and Output ---</span>
+<a name="l33"><span class="ln">33   </span></a>            <span class="s1">level </span><span class="s2">= </span><span class="s1">depth</span>
+<a name="l34"><span class="ln">34   </span></a>            <span class="s1">indent </span><span class="s2">= </span><span class="s3">' ' </span><span class="s2">* </span><span class="s5">4 </span><span class="s2">* </span><span class="s1">level </span><span class="s2">+ </span><span class="s3">'|-- ' </span><span class="s0">if </span><span class="s1">level </span><span class="s2">&gt; </span><span class="s5">0 </span><span class="s0">else </span><span class="s3">''</span>
+<a name="l35"><span class="ln">35   </span></a>            <span class="s1">f</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">indent</span><span class="s0">}{</span><span class="s1">os</span><span class="s2">.</span><span class="s1">path</span><span class="s2">.</span><span class="s1">basename</span><span class="s2">(</span><span class="s1">root</span><span class="s2">)</span><span class="s0">}\n</span><span class="s3">&quot;</span><span class="s2">) </span><span class="s4"># Write directory name</span>
+<a name="l36"><span class="ln">36   </span></a>
+<a name="l37"><span class="ln">37   </span></a>            <span class="s1">sub_indent </span><span class="s2">= </span><span class="s3">' ' </span><span class="s2">* </span><span class="s5">4 </span><span class="s2">* (</span><span class="s1">level </span><span class="s2">+ </span><span class="s5">1</span><span class="s2">) + </span><span class="s3">'|-- '</span>
+<a name="l38"><span class="ln">38   </span></a>            <span class="s0">for </span><span class="s1">file </span><span class="s0">in </span><span class="s1">sorted</span><span class="s2">(</span><span class="s1">files</span><span class="s2">): </span><span class="s4"># Sort files alphabetically</span>
+<a name="l39"><span class="ln">39   </span></a>                 <span class="s1">f</span><span class="s2">.</span><span class="s1">write</span><span class="s2">(</span><span class="s3">f&quot;</span><span class="s0">{</span><span class="s1">sub_indent</span><span class="s0">}{</span><span class="s1">file</span><span class="s0">}\n</span><span class="s3">&quot;</span><span class="s2">)</span>
+<a name="l40"><span class="ln">40   </span></a>
+<a name="l41"><span class="ln">41   </span></a>            <span class="s4"># Sort directories for consistent output</span>
+<a name="l42"><span class="ln">42   </span></a>            <span class="s1">dirs</span><span class="s2">.</span><span class="s1">sort</span><span class="s2">()</span>
+<a name="l43"><span class="ln">43   </span></a>
+<a name="l44"><span class="ln">44   </span></a>
+<a name="l45"><span class="ln">45   </span></a><span class="s4"># --- Configuration ---</span>
+<a name="l46"><span class="ln">46   </span></a><span class="s1">project_root </span><span class="s2">= </span><span class="s3">'.'  </span><span class="s4"># Use '.' for the current directory where the script is run</span>
+<a name="l47"><span class="ln">47   </span></a><span class="s1">output_filename </span><span class="s2">= </span><span class="s3">'project_structure_script.txt'</span>
+<a name="l48"><span class="ln">48   </span></a><span class="s4"># Optional: Specify directories/files to ignore, or set max_depth</span>
+<a name="l49"><span class="ln">49   </span></a><span class="s1">ignore_directories </span><span class="s2">= {</span><span class="s3">'.git'</span><span class="s2">, </span><span class="s3">'.idea'</span><span class="s2">, </span><span class="s3">'venv'</span><span class="s2">, </span><span class="s3">'__pycache__'</span><span class="s2">, </span><span class="s3">'dist'</span><span class="s2">, </span><span class="s3">'build'</span><span class="s2">, </span><span class="s3">'*.egg-info'</span><span class="s2">}</span>
+<a name="l50"><span class="ln">50   </span></a><span class="s4"># ignore_files_list = {'.env'}</span>
+<a name="l51"><span class="ln">51   </span></a><span class="s4"># depth_limit = 3 # Example: limit to 3 levels deep</span>
+<a name="l52"><span class="ln">52   </span></a>
+<a name="l53"><span class="ln">53   </span></a><span class="s1">print</span><span class="s2">(</span><span class="s3">f&quot;Generating file structure...&quot;</span><span class="s2">)</span>
+<a name="l54"><span class="ln">54   </span></a><span class="s1">list_files</span><span class="s2">(</span><span class="s1">project_root</span><span class="s2">, </span><span class="s1">output_filename</span><span class="s2">, </span><span class="s1">ignore_dirs</span><span class="s2">=</span><span class="s1">ignore_directories</span><span class="s2">) </span><span class="s4">#, max_depth=depth_limit)</span>
+<a name="l55"><span class="ln">55   </span></a><span class="s1">print</span><span class="s2">(</span><span class="s3">f&quot;File structure saved to </span><span class="s0">{</span><span class="s1">output_filename</span><span class="s0">}</span><span class="s3">&quot;</span><span class="s2">)</span></pre>
+</body>
+</html>
