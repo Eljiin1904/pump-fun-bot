@@ -1,180 +1,125 @@
-# src/core/instruction_builder.py
+# src/core/instruction_builder.py (Corrected Imports and Usage)
 
-import struct
-import logging # Added for the new method's logger
+# --- FIX: Corrected Imports ---
+import logging # Added for logger setup if not present
 from typing import List, Optional
-
-from solders.instruction import Instruction, AccountMeta
 from solders.pubkey import Pubkey
-# Import necessary client and SPL token functions for the new method
-from solana.rpc.async_api import AsyncClient
-from spl.token.instructions import create_associated_token_account, get_associated_token_address
+from solders.instruction import AccountMeta, Instruction
 
+# Import the class containing the constants
+from .pubkeys import PumpAddresses
+# REMOVED: from .pubkeys import SolanaProgramAddresses (Doesn't exist)
 
-# Import constants using the defined classes/variables
-from .pubkeys import PumpAddresses, SolanaProgramAddresses
+from ..utils.logger import get_logger # Adjusted relative import if needed
 
-from ..utils.logger import get_logger
+# --- END FIX ---
 
 # Use the project's logger setup
-logger = get_logger(__name__) # Or use: logging.getLogger(__name__)
+# logger = get_logger(__name__) # Or use: logging.getLogger(__name__)
+logger = logging.getLogger(__name__) # Assuming logger setup is handled elsewhere
 
 
 class InstructionBuilder:
-    """Builds various instructions needed for the bot."""
+    """ Helper class to build specific instructions for pump.fun or related programs. """
 
     @staticmethod
-    def get_create_ata_instruction(
-        payer_pubkey: Pubkey,
-        owner: Pubkey,
-        mint: Pubkey,
-    ) -> List[Instruction]:
-        """
-        DEPRECATED (potentially): Returns instruction(s) to create an Associated Token Account (ATA)
-        WITHOUT checking if it exists first. Use get_create_ata_instruction_if_needed instead.
-        """
-        # from spl.token.instructions import create_associated_token_account, get_associated_token_address # Already imported above
-
-        ata_address = get_associated_token_address(owner, mint)
-        logger.warning(f"Building create_associated_token_account ix for ATA: {ata_address} WITHOUT existence check. Consider using get_create_ata_instruction_if_needed.")
-
-        payer = payer_pubkey
-        instruction = create_associated_token_account(
-            payer=payer,
-            owner=owner,
-            mint=mint
-        )
-        return [instruction]
-
-    # <<< METHOD ADDED HERE >>>
-    @staticmethod
-    async def get_create_ata_instruction_if_needed(
-        payer_pubkey: Pubkey,
-        owner: Pubkey,
-        mint: Pubkey,
-        client: AsyncClient # Pass the raw AsyncClient here
-    ) -> List[Instruction]:
-        """
-        Checks if an Associated Token Account (ATA) exists and returns the
-        creation instruction only if it doesn't.
-
-        Args:
-            payer_pubkey: The account that will pay for the ATA creation.
-            owner: The owner of the ATA.
-            mint: The token mint the ATA is for.
-            client: An initialized Solana AsyncClient instance for checking existence.
-
-        Returns:
-            A list containing the create_associated_token_account instruction
-            if the ATA doesn't exist, otherwise an empty list.
-        """
-        try:
-            # Calculate the expected ATA address
-            ata_pubkey = get_associated_token_address(owner, mint)
-            logger.debug(f"Checking existence of ATA: {ata_pubkey} for owner {owner} and mint {mint}")
-
-            # Use the passed client to check if the account has data
-            # Use confirmed commitment for better reliability on existence checks
-            acc_info_resp = await client.get_account_info(ata_pubkey, commitment="confirmed")
-
-            # Check if the account exists (value is not None)
-            if acc_info_resp.value is None:
-                # Account does not exist, create instruction needed
-                logger.info(f"ATA {ata_pubkey} does not exist. Generating create instruction.")
-                instruction = create_associated_token_account(
-                    payer=payer_pubkey,
-                    owner=owner,
-                    mint=mint
-                )
-                return [instruction]
-            else:
-                # Account exists, no instruction needed
-                logger.debug(f"ATA {ata_pubkey} already exists.")
-                return []
-        except Exception as e:
-            # Log error but fallback to creating - might waste gas if it exists but check failed
-            logger.error(f"Error checking ATA existence for {ata_pubkey}: {e}. Proceeding with creation instruction as fallback.", exc_info=True)
-            instruction = create_associated_token_account(
-                payer=payer_pubkey,
-                owner=owner,
-                mint=mint
-            )
-            return [instruction]
-    # <<< END OF ADDED METHOD >>>
-
-
-    @staticmethod
-    def get_pump_buy_instruction(
-        user_pubkey: Pubkey,
-        mint_pubkey: Pubkey,
-        bonding_curve_pubkey: Pubkey,
-        associated_bonding_curve_pubkey: Pubkey, # Account #4 - SOL vault
-        user_token_account: Pubkey,
-        amount_lamports: int,
-        min_token_output: int
-    ) -> Optional[Instruction]:
-        """ Creates the instruction to buy tokens from pump.fun (Verified). """
-        logger.debug(f"Building pump.fun BUY: Mint={mint_pubkey}, Curve={bonding_curve_pubkey}, SOLIn={amount_lamports}, MinTokenOut={min_token_output}")
-        try:
-            buy_discriminator = bytes.fromhex("6271e96030555a2f")
-            packed_args = struct.pack("<QQ", amount_lamports, min_token_output)
-            instruction_data = buy_discriminator + packed_args
-            accounts = [
-                AccountMeta(pubkey=PumpAddresses.GLOBAL_ACCOUNT, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=PumpAddresses.FEE_RECIPIENT, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=bonding_curve_pubkey, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=associated_bonding_curve_pubkey, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=user_pubkey, is_signer=True, is_writable=True),
-                AccountMeta(pubkey=SolanaProgramAddresses.SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=SolanaProgramAddresses.TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=SolanaProgramAddresses.RENT_SYSVAR_ID, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=PumpAddresses.EVENT_AUTHORITY, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=PumpAddresses.PROGRAM_ID, is_signer=False, is_writable=False) # Use PROGRAM_ID
-            ]
-            instruction = Instruction(
-                program_id=PumpAddresses.PROGRAM_ID, # Use PROGRAM_ID
-                data=instruction_data,
-                accounts=accounts
-            )
-            return instruction
-        except Exception as build_exc: logger.error(f"Failed to build pump.fun BUY instruction: {build_exc}", exc_info=True); return None
-
-    @staticmethod
-    def get_pump_sell_instruction(
-        user_pubkey: Pubkey,
+    def build_buy_instruction(
+        user: Pubkey,
         mint_pubkey: Pubkey,
         bonding_curve_pubkey: Pubkey,
         associated_bonding_curve_pubkey: Pubkey,
-        user_token_account: Pubkey,
-        token_amount: int,
-        min_sol_output: int
-    ) -> Optional[Instruction]:
-        """ Creates the instruction to sell tokens on pump.fun (Verified). """
-        logger.debug(f"Building pump.fun SELL: Mint={mint_pubkey}, Curve={bonding_curve_pubkey}, TokenIn={token_amount}, MinSOLOut={min_sol_output}")
-        try:
-            sell_discriminator = bytes.fromhex("077572268873695f")
-            packed_args = struct.pack("<QQ", token_amount, min_sol_output)
-            instruction_data = sell_discriminator + packed_args
-            accounts = [
-                AccountMeta(pubkey=PumpAddresses.GLOBAL_ACCOUNT, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=PumpAddresses.FEE_RECIPIENT, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=bonding_curve_pubkey, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=associated_bonding_curve_pubkey, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=user_token_account, is_signer=False, is_writable=True),
-                AccountMeta(pubkey=user_pubkey, is_signer=True, is_writable=True),
-                AccountMeta(pubkey=SolanaProgramAddresses.SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=SolanaProgramAddresses.ASSOCIATED_TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=SolanaProgramAddresses.TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=PumpAddresses.EVENT_AUTHORITY, is_signer=False, is_writable=False),
-                AccountMeta(pubkey=PumpAddresses.PROGRAM_ID, is_signer=False, is_writable=False) # Use PROGRAM_ID
-            ]
-            instruction = Instruction(
-                program_id=PumpAddresses.PROGRAM_ID, # Use PROGRAM_ID
-                data=instruction_data,
-                accounts=accounts
-            )
-            return instruction
-        except Exception as build_exc: logger.error(f"Failed to build pump.fun SELL instruction: {build_exc}", exc_info=True); return None
+        token_amount_lamports: int, # Amount of pump tokens to receive
+        max_sol_cost_lamports: int, # Max SOL user is willing to pay
+        discriminator: bytes = bytes.fromhex("f5231e3e54b4cec7") # Buy instruction discriminator
+    ) -> Instruction:
+        """ Builds the instruction for buying tokens from the pump.fun bonding curve. """
+        logger.debug(f"Building buy instruction: User={user}, Mint={mint_pubkey}, Amount={token_amount_lamports}, MaxCost={max_sol_cost_lamports}")
+
+        # --- FIX: Access constants via PumpAddresses class ---
+        accounts = [
+            AccountMeta(pubkey=PumpAddresses.GLOBAL_STATE, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=PumpAddresses.FEE_RECIPIENT, is_signer=False, is_writable=True), # Fee recipient is writable
+            AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=bonding_curve_pubkey, is_signer=False, is_writable=True), # Curve state is modified
+            AccountMeta(pubkey=associated_bonding_curve_pubkey, is_signer=False, is_writable=True), # Curve's token account changes
+            AccountMeta(pubkey=Wallet.get_associated_token_address(user, mint_pubkey), is_signer=False, is_writable=True), # User's token account changes
+            AccountMeta(pubkey=user, is_signer=True, is_writable=True), # User pays SOL, is signer
+            AccountMeta(pubkey=PumpAddresses.SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=PumpAddresses.TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=PumpAddresses.RENT_SYSVAR, is_signer=False, is_writable=False),
+            AccountMeta(pubkey=PumpAddresses.ASSOCIATED_TOKEN_PROGRAM_ID, is_signer=False, is_writable=False), # Needed if ATA is created
+             # Add EVENT_AUTHORITY if required by specific instruction variant
+             # AccountMeta(pubkey=PumpAddresses.EVENT_AUTHORITY, is_signer=False, is_writable=False),
+        ]
+        # --- END FIX ---
+
+        # Pack the arguments (discriminator + token_amount + max_sol_cost)
+        # Ensure correct packing format (e.g., little-endian for u64)
+        instruction_data = discriminator + token_amount_lamports.to_bytes(8, 'little') + max_sol_cost_lamports.to_bytes(8, 'little')
+
+        # --- FIX: Access program ID via PumpAddresses class ---
+        return Instruction(
+            program_id=PumpAddresses.PROGRAM, # Use the correct program ID
+            accounts=accounts,
+            data=instruction_data
+        )
+        # --- END FIX ---
+
+    @staticmethod
+    def build_sell_instruction(
+        user: Pubkey,
+        mint_pubkey: Pubkey,
+        bonding_curve_pubkey: Pubkey,
+        associated_bonding_curve_pubkey: Pubkey,
+        token_amount_lamports: int, # Amount of pump tokens user is selling
+        min_sol_output_lamports: int, # Min SOL user expects back
+        discriminator: bytes = bytes.fromhex("346c2384a760e448") # Sell instruction discriminator
+    ) -> Instruction:
+        """ Builds the instruction for selling tokens back to the pump.fun bonding curve. """
+        logger.debug(f"Building sell instruction: User={user}, Mint={mint_pubkey}, Amount={token_amount_lamports}, MinOutput={min_sol_output_lamports}")
+
+        # --- FIX: Access constants via PumpAddresses class ---
+        accounts = [
+             AccountMeta(pubkey=PumpAddresses.GLOBAL_STATE, is_signer=False, is_writable=False),
+             AccountMeta(pubkey=PumpAddresses.FEE_RECIPIENT, is_signer=False, is_writable=True), # Fee recipient is writable
+             AccountMeta(pubkey=mint_pubkey, is_signer=False, is_writable=False), # Should not be writable for sell
+             AccountMeta(pubkey=bonding_curve_pubkey, is_signer=False, is_writable=True), # Curve state is modified
+             AccountMeta(pubkey=associated_bonding_curve_pubkey, is_signer=False, is_writable=True), # Curve's token account changes
+             AccountMeta(pubkey=Wallet.get_associated_token_address(user, mint_pubkey), is_signer=False, is_writable=True), # User's token account changes
+             AccountMeta(pubkey=user, is_signer=True, is_writable=True), # User receives SOL, is signer
+             AccountMeta(pubkey=PumpAddresses.SYSTEM_PROGRAM_ID, is_signer=False, is_writable=False),
+             AccountMeta(pubkey=PumpAddresses.TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
+             # Add EVENT_AUTHORITY if required by specific instruction variant
+             # AccountMeta(pubkey=PumpAddresses.EVENT_AUTHORITY, is_signer=False, is_writable=False),
+        ]
+        # --- END FIX ---
+
+        # Pack the arguments (discriminator + token_amount + min_sol_output)
+        instruction_data = discriminator + token_amount_lamports.to_bytes(8, 'little') + min_sol_output_lamports.to_bytes(8, 'little')
+
+        # --- FIX: Access program ID via PumpAddresses class ---
+        return Instruction(
+            program_id=PumpAddresses.PROGRAM, # Use the correct program ID
+            accounts=accounts,
+            data=instruction_data
+        )
+        # --- END FIX ---
+
+    # Add other instruction builders as needed (e.g., create ATA, close account)
+
+# Need Wallet class imported if get_associated_token_address is used as static method
+try:
+    from .wallet import Wallet
+except ImportError:
+    # Define a dummy if Wallet isn't available here, but real import is needed
+    logger.error("Wallet class import needed for InstructionBuilder.")
+    class Wallet: # Dummy
+        @staticmethod
+        def get_associated_token_address(owner: Pubkey, mint: Pubkey) -> Pubkey:
+            # This won't work without the real method, needs proper import or refactor
+            logger.warning("Using dummy Wallet.get_associated_token_address")
+            pda, _ = Pubkey.find_program_address(
+                 [bytes(owner), bytes(PumpAddresses.TOKEN_PROGRAM_ID), bytes(mint)],
+                 PumpAddresses.ASSOCIATED_TOKEN_PROGRAM_ID
+             )
+            return pda
