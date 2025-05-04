@@ -19,6 +19,9 @@ class TokenInfo:
     twitter: Optional[str] = None
     telegram: Optional[str] = None
     description: Optional[str] = None
+    # Ensure decimals is present if used elsewhere
+    decimals: Optional[int] = None
+
 
 @dataclass
 class TradeResult:
@@ -27,5 +30,8 @@ class TradeResult:
     tx_signature: Optional[str] = None
     error_message: Optional[str] = None
     price: Optional[float] = None   # Price in SOL per token
-    amount: Optional[float] = None  # UI amount bought/sold
-    initial_sol_liquidity: Optional[int] = None
+    amount: Optional[float] = None  # UI amount bought/sold (tokens for buy, SOL for sell)
+    initial_sol_liquidity: Optional[int] = None # Lamports in curve at time of buy prefetch
+    # --- FIX: Added error_type field ---
+    error_type: Optional[str] = None # e.g., BuildError, SendError, TxError, BalanceError, PrefetchError, MaxRetriesReached
+    # --- END FIX ---

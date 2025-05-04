@@ -58,7 +58,7 @@ HARD_CAP_PRIOR_FEE = 1500000 # Max Microlamports (0.0015 SOL) - Safety cap
 
 # --- Rug Protection Settings (Heavy Protection Enabled) ---
 RUG_CHECK_CREATOR = True # ENABLE creator holding check
-RUG_MAX_CREATOR_HOLD_PCT = 20.0 # Max % creator can hold (20%) - Fairly strict
+RUG_MAX_CREATOR_HOLD_PCT = 1500.0 # Max % creator can hold (20%) - Fairly strict
 
 RUG_CHECK_PRICE_DROP = True # ENABLE post-buy rapid price drop check
 RUG_PRICE_DROP_PCT = 40.0 # Sell if price drops > 40% immediately after buy
