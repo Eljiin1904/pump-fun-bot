@@ -1,109 +1,82 @@
-"""
-Configuration for the pump.fun trading bot.
+# src/config.py
 
-This file defines comprehensive parameters and settings for the trading bot.
-Carefully review and adjust values to match your trading strategy and risk tolerance.
-"""
+import os
+from dotenv import load_dotenv
 
-# Trading parameters
-# Control trade execution: amount of SOL per trade and acceptable price deviation
-BUY_AMOUNT: int | float = 0.000_001  # Amount of SOL to spend when buying
-# For an aggressive strategy, you may want a tighter tolerance on slippage.
-# However, these "slippage" values typically govern order execution rather than profit thresholds.
-BUY_SLIPPAGE: float = 0.02  # Allow up to 2% deviation on buy orders
-SELL_SLIPPAGE: float = 0.02  # Allow up to 2% deviation on sell orders
+# Load .env from the project root
+script_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(script_dir) 
+dotenv_path = os.path.join(project_root, '.env')
+load_dotenv(dotenv_path=dotenv_path)
 
-# Aggressive profit and stop-loss thresholds (new parameters)
-# Sell once the token price increases by 5% (profit target)
-SELL_PROFIT_THRESHOLD: float = 0.05  # 5% profit target
-# Sell if the token price drops more than 2% from the buy price (stop-loss)
-SELL_STOPLOSS_THRESHOLD: float = 0.02  # 2% drop triggers a sell
+# --- Solana Node Connection (Required - MUST be in .env or environment) ---
+SOLANA_NODE_RPC_ENDPOINT = os.getenv("SOLANA_NODE_RPC_ENDPOINT", "https://api.mainnet-beta.solana.com") # Default public RPC
+SOLANA_NODE_WSS_ENDPOINT = os.getenv("SOLANA_NODE_WSS_ENDPOINT", "wss://api.mainnet-beta.solana.com") # Default public WSS
+# It's highly recommended to use a private RPC provider (Helius, QuickNode, etc.) via .env
 
-# Priority fee configuration
-# Manage transaction speed and cost on the Solana network
-ENABLE_DYNAMIC_PRIORITY_FEE: bool = False  # Adaptive fee calculation
-ENABLE_FIXED_PRIORITY_FEE: bool = True  # Use consistent, predictable fee
-FIXED_PRIORITY_FEE: int = 2_000  # Base fee in microlamports
-EXTRA_PRIORITY_FEE: float = 0.0  # Percentage increase on priority fee (0.1 = 10%)
-HARD_CAP_PRIOR_FEE: int = 200_000  # Maximum allowable fee to prevent excessive spending in microlamports
+# --- Wallet (Required - MUST be in .env or environment) ---
+SOLANA_PRIVATE_KEY = os.getenv("SOLANA_PRIVATE_KEY") 
+# No default for private key
 
-# Listener configuration
-# Choose method for detecting new tokens on the network
-# "logs": Recommended for more stable token detection
-# "blocks": Unstable method, potentially less reliable
-LISTENER_TYPE = "logs"
+# --- Trading Parameters ---
+BUY_AMOUNT_SOL = 0.01      # Default buy amount in SOL
+BUY_SLIPPAGE_BPS = 1500    # Default 15%
+SELL_SLIPPAGE_BPS = 2500   # Default 25% for curve sells
+RAYDIUM_SELL_SLIPPAGE_BPS = 100 # Default 1% for Raydium sells
 
-# Retry and timeout settings
-# Control bot resilience and transaction handling
-MAX_RETRIES: int = 10  # Number of attempts for transaction submission
+# --- Sell Logic ---
+TAKE_PROFIT_MULTIPLIER = 10.0 # Default 10x
+STOP_LOSS_PERCENTAGE = 50.0   # Default 50% loss (value drops to 50% of buy)
 
-# Waiting periods in seconds between actions (TODO: to be replaced with retry mechanism)
-WAIT_TIME_AFTER_CREATION: int | float = 15  # Seconds to wait after token creation
-WAIT_TIME_AFTER_BUY: int | float = 120  # Holding period after buy transaction
-WAIT_TIME_BEFORE_NEW_TOKEN: int | float = 15  # Pause between token trades
+# --- Timing Parameters ---
+MAX_TOKEN_AGE_SECONDS = 60.0 
+WAIT_TIME_AFTER_CREATION_SECONDS = 5.0 
+MONITORING_INTERVAL_SECONDS = 7.5 # Slightly longer default check interval
 
-# Token and account management
-# Control token processing and account cleanup strategies
-# Maximum token age (in seconds) for processing—adjust as needed.
-MAX_TOKEN_AGE: int | float = 60
+# --- Transaction Settings ---
+MAX_BUY_RETRIES = 3 
+MAX_SELL_RETRIES = 2 
+MAX_RAYDIUM_SELL_RETRIES = 3 
+CONFIRM_TIMEOUT_SECONDS = 60 
 
-# Cleanup mode determines when to manage token accounts. Options:
-# "disabled": No cleanup will occur.
-# "on_fail": Only clean up if a buy transaction fails.
-# "after_sell": Clean up after selling, but only if the balance is zero.
-# "post_session": Clean up all empty accounts after a trading session ends.
-CLEANUP_MODE: str = "disabled"
-CLEANUP_FORCE_CLOSE_WITH_BURN: bool = False  # Burn remaining tokens before closing account, else skip ATA with non-zero balances
-CLEANUP_WITH_PRIORITY_FEE: bool = False  # Use priority fees for cleanup transactions
+# --- Listener Configuration ---
+LISTENER_TYPE = 'logs' # Default to logs listener
 
-# Node provider configuration (TODO: to be implemented)
-# Manage RPC node interaction to prevent rate limiting
-MAX_RPS: int = 50  # Maximum requests per second
+# --- Priority Fee Configuration ---
+ENABLE_DYNAMIC_FEE = True
+ENABLE_FIXED_FEE = False
+PRIORITY_FEE_FIXED_AMOUNT_MICROLAMPORTS = 10000 
+EXTRA_PRIORITY_FEE_MICROLAMPORTS = 1000 
+HARD_CAP_PRIORITY_FEE_MICROLAMPORTS = 1_000_000 # 0.001 SOL cap default
 
+# --- Compute Unit Limits ---
+BUY_COMPUTE_UNIT_LIMIT = 300_000  
+SELL_COMPUTE_UNIT_LIMIT = 200_000 
+RAYDIUM_SELL_COMPUTE_UNIT_LIMIT = 600_000 
+CLEANUP_COMPUTE_UNIT_LIMIT = 50_000 
 
-def validate_configuration() -> None:
-    """
-    Comprehensive validation of bot configuration.
+# --- Rug Protection Settings ---
+RUG_CHECK_CREATOR_ENABLED = True 
+RUG_MAX_CREATOR_HOLD_PCT = 25.0 # Default 25% 
 
-    Checks:
-    - Type correctness
-    - Value ranges
-    - Logical consistency of settings
-    """
-    # Configuration validation checks
-    config_checks = [
-        # (value, type, min_value, max_value, error_message)
-        (BUY_AMOUNT, (int, float), 0, float('inf'), "BUY_AMOUNT must be a positive number"),
-        (BUY_SLIPPAGE, float, 0, 1, "BUY_SLIPPAGE must be between 0 and 1"),
-        (SELL_SLIPPAGE, float, 0, 1, "SELL_SLIPPAGE must be between 0 and 1"),
-        (SELL_PROFIT_THRESHOLD, float, 0, 1, "SELL_PROFIT_THRESHOLD must be between 0 and 1"),
-        (SELL_STOPLOSS_THRESHOLD, float, 0, 1, "SELL_STOPLOSS_THRESHOLD must be between 0 and 1"),
-        (FIXED_PRIORITY_FEE, int, 0, float('inf'), "FIXED_PRIORITY_FEE must be a non-negative integer"),
-        (EXTRA_PRIORITY_FEE, float, 0, 1, "EXTRA_PRIORITY_FEE must be between 0 and 1"),
-        (HARD_CAP_PRIOR_FEE, int, 0, float('inf'), "HARD_CAP_PRIOR_FEE must be a non-negative integer"),
-        (MAX_RETRIES, int, 0, 100, "MAX_RETRIES must be between 0 and 100")
-    ]
+RUG_CHECK_PRICE_DROP_ENABLED = True 
+RUG_PRICE_DROP_PCT = 50.0 # Default 50% price drop trigger
 
-    for value, expected_type, min_val, max_val, error_msg in config_checks:
-        if not isinstance(value, expected_type):
-            raise ValueError(f"Type error: {error_msg}")
+RUG_CHECK_LIQUIDITY_DROP_ENABLED = True 
+RUG_LIQUIDITY_DROP_PCT = 60.0 # Default 60% liquidity drop trigger
 
-        if isinstance(value, (int, float)) and not (min_val <= value <= max_val):
-            raise ValueError(f"Range error: {error_msg}")
+# --- Account Cleanup ---
+CLEANUP_ATAS_ON_SELL = True # Default name used in Trader v2
+CLEANUP_MODE = 'after_sell' # Options: 'after_sell', 'on_fail', 'post_session', 'never'
+CLEANUP_WITH_PRIORITY_FEE = False # Default to False for cleanup TXs
 
-    # Logical consistency checks
-    if ENABLE_DYNAMIC_PRIORITY_FEE and ENABLE_FIXED_PRIORITY_FEE:
-        raise ValueError("Cannot enable both dynamic and fixed priority fees simultaneously")
+# --- V3: Raydium Transition Settings ---
+RAYDIUM_ENABLED = True # Default to enabled
+SOL_THRESHOLD_FOR_RAYDIUM = 300.0 # Default 300 SOL
+RAYDIUM_POOL_FETCH_RETRIES = 5 
+RAYDIUM_POOL_FETCH_DELAY_SECONDS = 10.0 
 
-    # Validate listener type
-    if LISTENER_TYPE not in ["logs", "blocks"]:
-        raise ValueError("LISTENER_TYPE must be either 'logs' or 'blocks'")
+# --- Account Cleanup ---
+CLEANUP_ATAS_ON_SELL = True 
 
-    # Validate cleanup mode
-    valid_cleanup_modes = ["disabled", "on_fail", "after_sell", "post_session"]
-    if CLEANUP_MODE not in valid_cleanup_modes:
-        raise ValueError(f"CLEANUP_MODE must be one of {valid_cleanup_modes}")
-
-
-# Validate configuration on import
-validate_configuration()
+print(f"DEBUG: Base config module 'src.config.py' loaded (used only if no specific strategy config is provided).")

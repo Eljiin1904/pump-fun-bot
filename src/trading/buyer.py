@@ -1,189 +1,206 @@
 # src/trading/buyer.py
 import asyncio
-from typing import Optional, Any, List, Sequence
-
-from solders.pubkey import Pubkey
-from solders.compute_budget import set_compute_unit_price, set_compute_unit_limit
-from solders.signature import Signature
+from typing import Optional, List
 from solders.instruction import Instruction
-from solders.commitment_config import CommitmentLevel
-from solana.rpc.commitment import Processed, Confirmed
-from solana.exceptions import SolanaRpcException
+from solders.pubkey import Pubkey
 
-# --- Project Imports ---
-from ..core.client import SolanaClient
-from ..core.curve import BondingCurveManager, BondingCurveState, LAMPORTS_PER_SOL, DEFAULT_TOKEN_DECIMALS
-from ..core.priority_fee.manager import PriorityFeeManager
-from ..core.wallet import Wallet
-from ..core.transactions import build_and_send_transaction, TransactionResult
-from ..core.instruction_builder import InstructionBuilder
-# --- FIX: base import needed for TradeResult ---
-from ..trading.base import TokenInfo, TradeResult
-# --- END FIX ---
-from ..utils.logger import get_logger
+from core.pubkeys import PumpAddresses
+from src.core.client import SolanaClient
+from src.core.wallet import Wallet
+from src.core.curve import BondingCurveManager, BondingCurveState, LAMPORTS_PER_SOL
+from src.core.priority_fee.manager import PriorityFeeManager
+from src.core.transactions import build_and_send_transaction, TransactionSendResult
+from src.core.instruction_builder import InstructionBuilder
+from src.trading.base import TokenInfo, TradeResult
+from src.utils.logger import get_logger
+from solana.rpc.commitment import Confirmed, Processed  # Added Processed for balance checks
 
-# Initialize logger at module level
-# logger = get_logger(__name__) # Keep if preferred for static methods
-
-FETCH_RETRY_DELAY_SECONDS = 4.0
-PREFETCH_RETRY_DELAY_SECONDS = 1.5
-MAX_PREFETCH_RETRIES = 5
-DEFAULT_COMPUTE_UNIT_LIMIT = 200_000
-DEFAULT_PREFETCH_COMMITMENT = CommitmentLevel.Processed
+logger = get_logger(__name__)
 
 
 class TokenBuyer:
-    def __init__(
-        self,
-        client: SolanaClient,
-        wallet: Wallet,
-        curve_manager: BondingCurveManager,
-        priority_fee_manager: PriorityFeeManager,
-        amount_sol: float,
-        slippage_decimal: float,
-        max_retries: int,
-        confirm_timeout: int,
-        compute_unit_limit: int = DEFAULT_COMPUTE_UNIT_LIMIT
-    ):
+    def __init__(self,
+                 client: SolanaClient,
+                 wallet: Wallet,
+                 curve_manager: BondingCurveManager,
+                 fee_manager: PriorityFeeManager,
+                 buy_amount_sol: float,
+                 slippage_bps: int,
+                 max_retries: int,
+                 confirm_timeout_seconds: int,
+                 priority_fee_cu_limit: int = 300_000,
+                 priority_fee_cu_price: Optional[int] = None
+                 ):
         self.client = client
         self.wallet = wallet
         self.curve_manager = curve_manager
-        self.priority_fee_manager = priority_fee_manager
-        self.amount_sol = amount_sol
-        self.amount_lamports = int(amount_sol * LAMPORTS_PER_SOL)
-        self.slippage_decimal = slippage_decimal
+        self.fee_manager = fee_manager
+        self.buy_amount_sol = buy_amount_sol
+        self.buy_amount_lamports = int(buy_amount_sol * LAMPORTS_PER_SOL)
+        self.slippage_bps = slippage_bps
         self.max_retries = max_retries
-        self.confirm_timeout = confirm_timeout
-        self.compute_unit_limit = compute_unit_limit
-        # --- FIX: Initialize logger for the instance ---
-        self.logger = get_logger(__name__)
-        # --- END FIX ---
-        self.logger.info(f"TokenBuyer Init: Amt={self.amount_sol:.6f}, Slip={self.slippage_decimal * 100:.2f}%, MaxRetries={self.max_retries}, CULimit={self.compute_unit_limit}")
+        self.confirm_timeout_seconds = confirm_timeout_seconds
+        self.priority_fee_cu_limit = priority_fee_cu_limit
+        self.priority_fee_cu_price = priority_fee_cu_price
+        logger.info(
+            f"TokenBuyer Init: BuyAmt={self.buy_amount_sol:.6f} SOL, SlipBPS={self.slippage_bps}, MaxRetries={self.max_retries}, CU Limit={self.priority_fee_cu_limit}")
 
+    def _calculate_min_tokens_out(self, curve_state: BondingCurveState, token_info: TokenInfo) -> int:
+        # ... (implementation from previous response, ensure it's accurate for pump.fun) ...
+        if self.buy_amount_lamports <= 0: return 0
+        if curve_state.virtual_sol_reserves == 0:
+            logger.warning(f"Cannot calculate tokens out for {token_info.symbol}, virtual SOL reserves are zero.")
+            return 0
+        try:
+            ratio = self.buy_amount_lamports / curve_state.virtual_sol_reserves
+            estimated_tokens_raw = curve_state.virtual_token_reserves * ((1 + ratio) ** 0.5 - 1)
+            estimated_tokens = int(estimated_tokens_raw)
+        except ZeroDivisionError:
+            logger.error(f"ZeroDivisionError while estimating tokens out for {token_info.symbol}.")
+            return 0
+        except OverflowError:
+            logger.error(f"OverflowError calculating estimated tokens for {token_info.symbol}.")
+            return 0
+        if estimated_tokens <= 0:
+            logger.warning(f"Estimated tokens out is {estimated_tokens} for {token_info.symbol} before slippage.")
+            return 0
+        min_tokens_out = int(estimated_tokens * (1 - (self.slippage_bps / 10000.0)))
+        logger.info(
+            f"Buy Estimation for {token_info.symbol}: SOL_in={self.buy_amount_lamports}, Est.Tokens={estimated_tokens}, MinTokensOut (Slip {self.slippage_bps}BPS)={min_tokens_out}")
+        return min_tokens_out
 
-    async def _prefetch_curve_state(self, bonding_curve_pubkey: Pubkey, token_symbol: str) -> Optional[BondingCurveState]:
-        """ Fetches the curve state with retries before the buy attempt. """
-        for attempt in range(MAX_PREFETCH_RETRIES):
-            self.logger.debug(f"Prefetch attempt {attempt + 1}/{MAX_PREFETCH_RETRIES} for {token_symbol} curve state...")
-            try:
-                # --- Pass correct commitment type (enum or None) ---
-                curve_state = await self.curve_manager.get_curve_state(
-                    bonding_curve_pubkey,
-                    commitment=DEFAULT_PREFETCH_COMMITMENT
-                )
-                if curve_state:
-                    self.logger.info(f"Prefetch successful for {token_symbol} curve state.")
-                    return curve_state
-                else:
-                     self.logger.warning(f"Prefetch attempt {attempt+1} failed: get_curve_state returned None.")
-            except Exception as prefetch_e:
-                # Log the specific error from get_curve_state if it raised one
-                self.logger.warning(f"Prefetch attempt {attempt + 1} failed with exception: {prefetch_e}", exc_info=True)
-
-            # Delay before next prefetch attempt
-            if attempt < MAX_PREFETCH_RETRIES - 1:
-                self.logger.debug(f"Prefetch attempt {attempt + 1} unsuccessful, sleeping for {PREFETCH_RETRY_DELAY_SECONDS}s...")
-                await asyncio.sleep(PREFETCH_RETRY_DELAY_SECONDS)
-
-        self.logger.warning(f"Prefetch failed for {token_symbol} curve state after {MAX_PREFETCH_RETRIES} attempts.")
-        return None
-
+    async def _get_token_balance(self, token_account_pubkey: Pubkey) -> int:
+        """Helper to get token balance, returns 0 on error or if account doesn't exist."""
+        try:
+            balance_resp = await self.client.get_token_account_balance(token_account_pubkey,
+                                                                       commitment=Processed)  # Use Processed for faster balance checks
+            if balance_resp and balance_resp.value:
+                return int(balance_resp.value.amount)
+        except Exception as e:
+            logger.warning(f"Could not fetch balance for {token_account_pubkey}: {e}")
+        return 0
 
     async def execute(self, token_info: TokenInfo) -> TradeResult:
-        """ Executes the token buy process with retries. """
-        # --- Use self.logger throughout this method ---
-        self.logger.info(f"Executing buy for {token_info.symbol} ({token_info.mint})")
-        retry_count = 0
-        initial_sol_reserves: Optional[int] = None
-        error_message: str = f"Buy failed for {token_info.symbol} after max retries"
-        last_exception: Optional[Exception] = None
-        error_type_str = "MaxRetriesReached" # Default error type if loop finishes
+        logger.info(f"Attempting buy for {token_info.symbol} ({token_info.mint_str}) with {self.buy_amount_sol} SOL")
 
-        user_pubkey = self.wallet.pubkey
-        mint_pubkey = token_info.mint
+        # ... (initial checks for bonding_curve_address, get curve_state, check is_complete, liquidity from previous response) ...
+        if not token_info.bonding_curve_address:  # From previous
+            return TradeResult(token_info=token_info, success=False, error="Missing bonding_curve_address")
+        curve_state = await self.curve_manager.get_curve_state(token_info.bonding_curve_address)
+        if not curve_state:
+            return TradeResult(token_info=token_info, success=False,
+                               error="Failed to fetch bonding curve state pre-buy")
+        initial_sol_liquidity_lamports = curve_state.virtual_sol_reserves
+        if curve_state.is_complete:
+            return TradeResult(token_info=token_info, success=False, error="Bonding curve complete",
+                               initial_sol_liquidity=initial_sol_liquidity_lamports)
+        # ...
 
-        try:
-            bonding_curve_pubkey, _ = BondingCurveManager.find_bonding_curve_pda(mint_pubkey)
-            associated_bonding_curve_pubkey, _ = BondingCurveManager.find_associated_bonding_curve_pda(mint_pubkey)
-        except Exception as pda_e:
-            self.logger.error(f"BUYER: Failed PDA derivation {mint_pubkey}: {pda_e}")
-            # Pass error_type correctly
-            return TradeResult(success=False, error_message="Failed PDA derivation", error_type="BuildError")
+        min_tokens_out = self._calculate_min_tokens_out(curve_state, token_info)
+        if min_tokens_out <= 0 and self.buy_amount_lamports > 0:
+            return TradeResult(token_info=token_info, success=False, error="Min tokens out calculation failed",
+                               initial_sol_liquidity=initial_sol_liquidity_lamports)
 
-        user_token_account = Wallet.get_associated_token_address(user_pubkey, mint_pubkey)
+        tx_result: Optional[TransactionSendResult] = None
+        user_ata_pubkey = InstructionBuilder.get_associated_token_address(self.wallet.pubkey, token_info.mint)
 
-        priority_fee_target_accounts: List[Pubkey] = [
-            mint_pubkey, bonding_curve_pubkey, associated_bonding_curve_pubkey,
-            user_token_account,
-        ]
+        # Get token balance BEFORE the transaction
+        balance_before_lamports = await self._get_token_balance(user_ata_pubkey)
+        logger.info(f"Token balance for {token_info.symbol} ({user_ata_pubkey}) BEFORE buy: {balance_before_lamports}")
 
-        # Prefetch state before entering retry loop
-        initial_curve_state = await self._prefetch_curve_state(bonding_curve_pubkey, token_info.symbol)
-        if not initial_curve_state:
-            # Pass error_type correctly
-            return TradeResult(success=False, error_message="Failed to fetch bonding curve state during prefetch.", error_type="PrefetchError")
-        initial_sol_reserves = initial_curve_state.virtual_sol_reserves
-
-        # --- Buy Retry Loop ---
-        while retry_count < self.max_retries:
-            retry_count += 1
-            self.logger.info(f"Buy attempt {retry_count}/{self.max_retries} for {token_info.symbol} ({mint_pubkey})")
-            last_exception = None
-
+        for attempt in range(self.max_retries):
+            # ... (instruction building logic from previous response, including ATA creation check, priority fees, buy_ix) ...
+            logger.info(f"Buy attempt {attempt + 1}/{self.max_retries} for {token_info.symbol}")
+            instructions: List[Instruction] = []
             try:
-                if retry_count == 1: curve_state = initial_curve_state
-                else: curve_state = await self.curve_manager.get_curve_state(bonding_curve_pubkey, commitment=CommitmentLevel.Confirmed)
+                ata_account_info = await self.client.get_account_info(user_ata_pubkey, commitment=Confirmed)
+                if ata_account_info is None or ata_account_info.value is None:
+                    logger.info(
+                        f"User ATA {user_ata_pubkey} for {token_info.symbol} does not exist. Adding create instruction.")
+                    create_ata_ix = InstructionBuilder.get_create_ata_instruction(
+                        payer=self.wallet.pubkey, owner=self.wallet.pubkey, mint=token_info.mint,
+                        ata_pubkey=user_ata_pubkey
+                    )
+                    instructions.append(create_ata_ix)
 
-                if not curve_state:
-                    error_message = "Failed fetch curve state retry."; self.logger.warning(f"{error_message} Retrying...");
-                    await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS); continue
+                fee_check_accounts = [
+                    PumpAddresses.GLOBAL_STATE, PumpAddresses.FEE_RECIPIENT, token_info.mint,
+                    token_info.bonding_curve_address, token_info.associated_bonding_curve_address,
+                    user_ata_pubkey, self.wallet.pubkey
+                ]
+                priority_fee_details = await self.fee_manager.get_priority_fee(accounts_to_check=fee_check_accounts)
+                cu_limit_actual = self.priority_fee_cu_limit
+                cu_price_actual = self.priority_fee_cu_price if self.priority_fee_cu_price is not None \
+                    else (priority_fee_details.fee if priority_fee_details else 1)
+                if cu_limit_actual: instructions.append(InstructionBuilder.set_compute_unit_limit(cu_limit_actual))
+                if cu_price_actual: instructions.append(InstructionBuilder.set_compute_unit_price(cu_price_actual))
 
-                est_tokens_out = curve_state.calculate_tokens_out_for_sol(self.amount_lamports)
-                min_tokens_out_for_slippage = int(est_tokens_out * (1 - self.slippage_decimal))
-                min_token_output_for_ix = max(0, min_tokens_out_for_slippage)
-                self.logger.debug(f"Est TknOut: {est_tokens_out}, MinTknOut (Slippage): {min_token_output_for_ix}, MaxSOLIn: {self.amount_lamports}")
+                buy_ix = InstructionBuilder.build_pump_fun_buy_instruction(
+                    user_wallet_pubkey=self.wallet.pubkey, mint_pubkey=token_info.mint,
+                    bonding_curve_pubkey=token_info.bonding_curve_address,
+                    assoc_bonding_curve_token_account_pubkey=token_info.associated_bonding_curve_address,
+                    sol_amount_in_lamports=self.buy_amount_lamports,
+                    min_token_output_lamports=min_tokens_out
+                )
+                instructions.append(buy_ix)
 
-                if min_token_output_for_ix <= 0 and est_tokens_out <= 0:
-                    error_message = "Est tokens out <= 0."; self.logger.warning(error_message);
-                    if est_tokens_out <= 0: error_message = "Buy failed: Est tokens out zero."; break
-                    await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS); continue
+                tx_result = await build_and_send_transaction(
+                    client=self.client, wallet_keypair=self.wallet.keypair, instructions=instructions,
+                    signers=[self.wallet.keypair], log_prefix=f"Buy_{token_info.symbol[:5]}",
+                    commitment=Confirmed, confirm_timeout_seconds=self.confirm_timeout_seconds,
+                    max_send_retries=1
+                )
+            # ... (exception handling from previous response) ...
+            except Exception as e:
+                error_msg = f"Exception during buy attempt {attempt + 1} for {token_info.symbol}: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                tx_result = TransactionSendResult(success=False, error=error_msg)  # Ensure tx_result is set for logging
+                # No break here, let retry logic handle it unless it's a fatal error type
 
-                compute_unit_price_micro_lamports = 0
-                try:
-                    fee = await self.priority_fee_manager.calculate_priority_fee(accounts=priority_fee_target_accounts)
-                    if fee is not None and fee > 0: compute_unit_price_micro_lamports = int(fee); self.logger.info(f"Using priority fee: {compute_unit_price_micro_lamports} micro-lamports")
-                    elif fee == 0: self.logger.info("Priority Fee Manager returned 0.")
-                    else: self.logger.warning("Priority Fee Manager returned None. Using 0.")
-                except AttributeError as fee_attr_err: self.logger.error(f"PriorityFeeManager missing method? {fee_attr_err}. Using 0 fee.", exc_info=True)
-                except Exception as fee_e: self.logger.error(f"Error calculating priority fee: {fee_e}. Using 0.", exc_info=True)
+            if tx_result and tx_result.success and tx_result.signature:
+                logger.info(
+                    f"BUY_SUCCESS_SENT: {token_info.symbol}. Tx: {tx_result.signature}. Confirming and fetching actual balance...")
 
-                instructions: List[Instruction] = []
-                instructions.append(set_compute_unit_limit(self.compute_unit_limit))
-                if compute_unit_price_micro_lamports > 0: instructions.append(set_compute_unit_price(compute_unit_price_micro_lamports))
-                ata_instructions: List[Instruction] = await InstructionBuilder.get_create_ata_instruction_if_needed( payer_pubkey=user_pubkey, owner=user_pubkey, mint=mint_pubkey, client=self.client.get_async_client() ); instructions.extend(ata_instructions)
-                buy_instruction = InstructionBuilder.get_pump_buy_instruction( user_pubkey=user_pubkey, mint_pubkey=mint_pubkey, bonding_curve_pubkey=bonding_curve_pubkey, associated_bonding_curve_pubkey=associated_bonding_curve_pubkey, user_token_account=user_token_account, amount_lamports=self.amount_lamports, min_token_output=min_token_output_for_ix )
-                if buy_instruction is None: error_message = "Failed build buy instruction"; self.logger.error(error_message + ". Stopping."); break; instructions.append(buy_instruction)
+                # Wait a brief moment for state to propagate before fetching balance_after
+                await asyncio.sleep(2.0)  # Adjust as needed, or use transaction confirmation status for timing
 
-                tx_result: TransactionResult = await build_and_send_transaction( client=self.client, payer=self.wallet.payer, instructions=instructions, label=f"Buy_{token_info.symbol[:5]}", confirm=True, confirm_timeout_secs=self.confirm_timeout, confirm_commitment="confirmed", max_retries_sending=1 )
+                balance_after_lamports = await self._get_token_balance(user_ata_pubkey)
+                logger.info(
+                    f"Token balance for {token_info.symbol} ({user_ata_pubkey}) AFTER buy: {balance_after_lamports}")
 
-                if tx_result.success and tx_result.signature:
-                    self.logger.info(f"Buy tx CONFIRMED: {tx_result.signature}")
-                    est_tokens_out_initial = initial_curve_state.calculate_tokens_out_for_sol(self.amount_lamports); amount_tokens_bought_estimate_ui = 0.0; buy_price_sol_per_token_estimate = 0.0;
-                    token_decimals = token_info.decimals if token_info.decimals is not None else DEFAULT_TOKEN_DECIMALS
-                    if est_tokens_out_initial > 0: amount_tokens_bought_estimate_ui = est_tokens_out_initial / (10 ** token_decimals)
-                    if amount_tokens_bought_estimate_ui > 0: buy_price_sol_per_token_estimate = self.amount_sol / amount_tokens_bought_estimate_ui
-                    # Ensure error_type is None on success
-                    return TradeResult( success=True, tx_signature=tx_result.signature, price=buy_price_sol_per_token_estimate, amount=amount_tokens_bought_estimate_ui, initial_sol_liquidity=initial_sol_reserves, error_type=None )
-                else:
-                    error_message = f"Buy tx failed ({tx_result.error_type}): {tx_result.error_message or 'No message'}"; self.logger.warning(f"{error_message}. Retrying attempt {retry_count+1}..."); last_exception = RuntimeError(error_message); error_type_str = tx_result.error_type or "SendConfirmError"; await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS + retry_count); continue
+                actual_tokens_acquired = balance_after_lamports - balance_before_lamports
 
-            except Exception as loop_exception:
-                last_exception = loop_exception; error_message = f"Unexpected error buy attempt {retry_count}: {loop_exception}"; self.logger.error(error_message, exc_info=True); error_type_str = type(loop_exception).__name__
-                if "Failed to build buy instruction" in str(loop_exception): break
-                if retry_count < self.max_retries: await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS + retry_count * 2)
+                if actual_tokens_acquired < 0:  # Should not happen if buy was successful
+                    logger.warning(
+                        f"Acquired token calculation resulted in negative value ({actual_tokens_acquired}) for {token_info.symbol}. Using min_tokens_out as fallback.")
+                    actual_tokens_acquired = min_tokens_out  # Fallback to estimate
+                elif actual_tokens_acquired == 0 and min_tokens_out > 0:
+                    logger.warning(
+                        f"Actual tokens acquired is 0, but min_tokens_out was {min_tokens_out} for {token_info.symbol}. This might indicate an issue or a very small buy. Using min_tokens_out.")
+                    actual_tokens_acquired = min_tokens_out  # Fallback if balance check seems off for a successful tx
 
-        self.logger.error(f"Failed buy {token_info.symbol} after {retry_count}/{self.max_retries} attempts: {error_message}")
-        # Use error_type when returning failure
-        if last_exception and not error_type_str: error_type_str = type(last_exception).__name__
-        # Pass error_type correctly
-        return TradeResult(success=False, error_message=error_message, initial_sol_liquidity=initial_sol_reserves, error_type=error_type_str)
+                logger.info(f"Actual tokens acquired for {token_info.symbol}: {actual_tokens_acquired}")
+
+                return TradeResult(
+                    token_info=token_info, signature=tx_result.signature, success=True,
+                    initial_sol_liquidity=initial_sol_liquidity_lamports,
+                    spent_lamports=self.buy_amount_lamports,
+                    acquired_tokens=actual_tokens_acquired
+                )
+            else:  # tx_result is None or not successful
+                error_msg = tx_result.error if tx_result and tx_result.error else "Send transaction failed or no signature."
+                logger.warning(f"Buy attempt {attempt + 1} for {token_info.symbol} failed: {error_msg}")
+                if "Insufficient funds" in error_msg:
+                    logger.error(f"BUY_FAIL: Insufficient funds for {token_info.symbol}. Aborting retries.")
+                    return TradeResult(token_info=token_info, success=False, error=error_msg,
+                                       initial_sol_liquidity=initial_sol_liquidity_lamports)
+
+            if attempt < self.max_retries - 1:
+                await asyncio.sleep(1.0 + (attempt * 0.75))
+
+        final_error = tx_result.error if tx_result and tx_result.error else "Buy failed after max retries."
+        logger.error(f"BUY_FAIL: {token_info.symbol} after {self.max_retries} attempts. Last error: {final_error}")
+        return TradeResult(
+            token_info=token_info, success=False, error=final_error,
+            initial_sol_liquidity=initial_sol_liquidity_lamports
+        )

@@ -1,382 +1,291 @@
 # src/tools/raydium_amm.py
 
-import httpx
 import asyncio
-import struct
-import math # Needed for floor operation
-from typing import Optional, Dict, Any, List, Tuple
+import httpx
+import time
+from typing import List, Optional, Dict, Any
+from dataclasses import dataclass, field
 
 from solders.pubkey import Pubkey
-from solders.instruction import Instruction, AccountMeta
-from spl.token.instructions import get_associated_token_address, create_associated_token_account
-from solana.rpc.types import TokenAccountOpts # For get_token_account_balance
+from solders.instruction import Instruction
+from solders.keypair import Keypair  # Import Keypair for type hint
 
-from ..core.client import SolanaClient # Client is now essential
-from ..utils.logger import get_logger
-from ..core.pubkeys import SolanaProgramAddresses # Import your program addresses
+from src.core.client import SolanaClient
+from src.core.instruction_builder import InstructionBuilder
+from src.core.pubkeys import SolanaProgramAddresses, PumpAddresses  # Need PumpAddresses if used here
+
+# --- CORRECTED IMPORT for raydium_amm_v4 ---
+# Assuming these are the necessary components from that file
+from src.core.raydium_amm_v4 import make_swap_instruction, SwapAccounts, SwapArgs
+# --- END CORRECTION ---
+
+from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+LAMPORTS_PER_SOL = 1_000_000_000
+RAYDIUM_LIQUIDITY_ENDPOINT = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json"
+WSOL_MINT_STR = "So11111111111111111111111111111111111111112"
 
-# --- Constants ---
-RAYDIUM_LP_V4_PROGRAM_ID = Pubkey.from_string("675kPX9MHTjS2zt1qfr1NYHuzeLXfQM9H24wFSUt1Mp8")
-SERUM_DEX_PROGRAM_ID = Pubkey.from_string("srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX") # Verify this ID
-WSOL_ADDRESS = Pubkey.from_string("So11111111111111111111111111111111111111112")
-RAYDIUM_LIQUIDITY_JSON_URL = "https://api.raydium.io/v2/sdk/liquidity/mainnet.json"
-# Raydium Fee Numerator / Denominator (0.25% fee --> 25 / 10000, but input amount is reduced)
-# Input amount retains 99.75% of its value for calculation (9975 / 10000)
-FEE_NUMERATOR = 25
-FEE_DENOMINATOR = 10000
-INPUT_AMOUNT_RETAIN_NUMERATOR = 9975 # 10000 - 25
-INPUT_AMOUNT_RETAIN_DENOMINATOR = 10000
 
-# Required keys from API/Pool Info for V4 Swap
-# Includes the crucial market accounts
-POOL_INFO_REQUIRED_KEYS = [
-    "id", # AMM ID
-    "authority",
-    "baseMint",
-    "quoteMint",
-    "lpMint",
-    "baseVault",
-    "quoteVault",
-    "marketId",
-    "openOrders",
-    "marketBaseVault", # Market Keys Start Here
-    "marketQuoteVault",
-    "marketAuthority", # Vault Signer
-    "marketBids",
-    "marketAsks",
-    "marketEventQueue"
-]
+@dataclass
+class RaydiumPoolInfo:
+    # ... (Definition from previous response remains unchanged) ...
+    id: str
+    program_id: str
+    base_mint: str
+    quote_mint: str
+    lp_mint: str
+    base_decimals: int
+    quote_decimals: int
+    lp_decimals: int
+    amm_id: Pubkey = field(init=False)
+    market_id: str
+    base_vault: str
+    quote_vault: str
+    lp_vault: str
+    model_data_account: str
+    open_orders: str
+    target_orders: str
+    withdraw_queue: str
+    amm_authority: str
+    market_program_id: Optional[str] = None
+    market_base_vault: Optional[str] = None
+    market_quote_vault: Optional[str] = None
+    market_authority: Optional[str] = None
+    liquidity_usd: Optional[float] = None
+    # --- Add extra_data field to store Serum market accounts ---
+    extra_data: Dict[str, Any] = field(default_factory=dict)
+
+    def __post_init__(self):
+        self.amm_id = Pubkey.from_string(self.id)
+
+    def __str__(self):
+        base_sym = self.base_mint[:4] + "..." + self.base_mint[-4:]
+        quote_sym = self.quote_mint[:4] + "..." + self.quote_mint[-4:]
+        return f"RaydiumPool(Pair={base_sym}/{quote_sym}, ID={self.id[:8]}...)"
 
 
 class RaydiumAMMInfoFetcher:
-    """Fetches and validates Raydium AMM pool information using Raydium's API."""
+    # ... (Implementation from previous response remains unchanged) ...
+    def __init__(self, endpoint: str = RAYDIUM_LIQUIDITY_ENDPOINT, request_timeout: int = 10):
+        self.endpoint = endpoint
+        self.timeout = request_timeout
+        self.pools_cache: List[Dict[str, Any]] = []
+        self.cache_last_updated: float = 0
+        self.cache_ttl_seconds: int = 300
 
-    _instance = None
-    _lock = asyncio.Lock()
-    _pool_data: Optional[Dict[str, Any]] = None
-    _last_fetch_time: float = 0
-    _cache_duration: int = 300 # Cache pool data for 5 minutes
+    async def _fetch_all_pools(self) -> Optional[List[Dict[str, Any]]]:
+        # ... (fetch logic) ...
+        now = time.time()
+        if self.pools_cache and (now - self.cache_last_updated < self.cache_ttl_seconds):
+            return self.pools_cache
+        logger.info(f"Fetching Raydium pool data from {self.endpoint}...")
+        try:
+            async with httpx.AsyncClient(timeout=self.timeout) as client:
+                response = await client.get(self.endpoint)
+                response.raise_for_status()
+                data = response.json()
+                official_pools = data.get("official", [])
+                unofficial_pools = data.get("unOfficial", [])
+                all_pools = official_pools + unofficial_pools
+                if not all_pools: return None
+                self.pools_cache = all_pools
+                self.cache_last_updated = now
+                logger.info(f"Fetched and cached {len(all_pools)} Raydium pools.")
+                return self.pools_cache
+        except Exception as e:
+            logger.error(f"Error fetching Raydium pools: {e}", exc_info=True)
+            return None
 
-    def __new__(cls, *args, **kwargs):
-        if cls._instance is None:
-            cls._instance = super(RaydiumAMMInfoFetcher, cls).__new__(cls)
-        return cls._instance
-
-    def __init__(self, client: SolanaClient):
-        # Client is needed if on-chain fallbacks are ever implemented
-        self.client = client
-        logger.info("RaydiumAMMInfoFetcher initialized (using API).")
-
-    async def _fetch_and_cache_pool_data(self) -> bool:
-        current_time = asyncio.get_event_loop().time()
-        async with self._lock:
-            if self._pool_data is not None and (current_time - self._last_fetch_time) < self._cache_duration:
-                logger.debug("Using cached Raydium pool data.")
-                return True
-
-            logger.info(f"Fetching updated Raydium pool data from API: {RAYDIUM_LIQUIDITY_JSON_URL}")
+    async def get_pool_info_for_token(self, token_mint_str: str) -> List[RaydiumPoolInfo]:
+        all_pools_data = await self._fetch_all_pools()
+        if not all_pools_data: return []
+        found_pools: List[RaydiumPoolInfo] = []
+        for pool_data in all_pools_data:
+            base_mint = pool_data.get("baseMint")
+            quote_mint = pool_data.get("quoteMint")
+            if token_mint_str not in [base_mint, quote_mint]: continue
+            is_wsol_pair = (base_mint == token_mint_str and quote_mint == WSOL_MINT_STR) or \
+                           (quote_mint == token_mint_str and base_mint == WSOL_MINT_STR)
+            required_keys = [
+                "id", "programId", "baseMint", "quoteMint", "lpMint", "baseDecimals",
+                "quoteDecimals", "lpDecimals", "marketId", "baseVault", "quoteVault",
+                "lpVault", "modelDataAccount", "openOrders", "targetOrders",
+                "withdrawQueue", "authority"
+            ]
+            if not all(key in pool_data for key in required_keys): continue
             try:
-                async with httpx.AsyncClient(timeout=20.0) as http_client:
-                    response = await http_client.get(RAYDIUM_LIQUIDITY_JSON_URL)
-                    response.raise_for_status()
-                    data = response.json()
+                # --- Store market program/vaults if available ---
+                extra_pool_data = {}
+                market_program_id = pool_data.get("marketProgramId")
+                market_base_vault = pool_data.get("marketBaseVault")
+                market_quote_vault = pool_data.get("marketQuoteVault")
+                market_authority = pool_data.get("marketAuthority")
 
-                if 'official' not in data:
-                    logger.error("Raydium API response format unexpected (missing 'official' key).")
-                    self._pool_data = None
-                    return False
+                # You might need to fetch serum market details separately if not here
+                # Placeholder for serum market accounts needed for swap
+                extra_pool_data["serum_bids"] = pool_data.get("marketBids")  # Assuming keys exist in API
+                extra_pool_data["serum_asks"] = pool_data.get("marketAsks")  # Assuming keys exist in API
+                extra_pool_data["serum_event_queue"] = pool_data.get("marketEventQueue")  # Assuming keys exist in API
+                extra_pool_data["serum_vault_signer"] = pool_data.get("vaultSigner")  # Assuming keys exist in API
 
-                processed_pools = {}
-                pool_count = 0
-                for pool in data.get('official', []):
-                    pool_id = pool.get('id')
-                    base_mint = pool.get('baseMint')
-                    quote_mint = pool.get('quoteMint')
-                    if not pool_id or not base_mint or not quote_mint: continue
-
-                    # Store the raw pool dict by ID
-                    processed_pools[pool_id] = pool
-                    pool_count += 1
-
-                    # Index by mints for quick lookup
-                    if base_mint not in processed_pools: processed_pools[base_mint] = []
-                    if quote_mint not in processed_pools: processed_pools[quote_mint] = []
-                    processed_pools[base_mint].append(pool)
-                    processed_pools[quote_mint].append(pool)
-
-                # TODO: Optionally process 'unOfficial' pools if needed
-
-                self._pool_data = processed_pools
-                self._last_fetch_time = current_time
-                logger.info(f"Successfully fetched and cached {pool_count} official Raydium pools.")
-                return True
-
-            except httpx.RequestError as e:
-                logger.error(f"HTTP error fetching Raydium pool data: {e}")
-                self._pool_data = None
-                return False
+                pool_info = RaydiumPoolInfo(
+                    id=pool_data["id"], program_id=pool_data["programId"], base_mint=pool_data["baseMint"],
+                    quote_mint=pool_data["quoteMint"], lp_mint=pool_data["lpMint"],
+                    base_decimals=pool_data["baseDecimals"],
+                    quote_decimals=pool_data["quoteDecimals"], lp_decimals=pool_data["lpDecimals"],
+                    market_id=pool_data["marketId"],
+                    base_vault=pool_data["baseVault"], quote_vault=pool_data["quoteVault"],
+                    lp_vault=pool_data["lpVault"],
+                    model_data_account=pool_data["modelDataAccount"], open_orders=pool_data["openOrders"],
+                    target_orders=pool_data["targetOrders"], withdraw_queue=pool_data["withdrawQueue"],
+                    amm_authority=pool_data["authority"],
+                    market_program_id=market_program_id, market_base_vault=market_base_vault,
+                    market_quote_vault=market_quote_vault, market_authority=market_authority,
+                    liquidity_usd=pool_data.get("tvl"),
+                    extra_data=extra_pool_data  # Store potential serum details
+                )
+                if is_wsol_pair:
+                    found_pools.insert(0, pool_info)
+                else:
+                    found_pools.append(pool_info)
             except Exception as e:
-                logger.error(f"Error processing Raydium pool data: {e}", exc_info=True)
-                self._pool_data = None
-                return False
-
-    async def get_pool_info_for_token(self, token_mint_address: str) -> Optional[Dict[str, Any]]:
-        """
-        Finds VALIDATED Raydium pool info for a given token, prioritizing WSOL pairs.
-        Ensures all required keys for V4 swap are present.
-        """
-        if not await self._fetch_and_cache_pool_data() or self._pool_data is None:
-            logger.error("Cannot get pool info: Failed to fetch or cache Raydium pool data.")
-            return None
-
-        target_mint = token_mint_address
-        wsol_mint = WSOL_ADDRESS.to_base58()
-        potential_pools = self._pool_data.get(target_mint, [])
-
-        if not potential_pools:
-            logger.warning(f"No pools found involving token {target_mint} in Raydium API data.")
-            return None
-
-        # Find the best pool (WSOL pair) and validate its keys
-        best_pool_info = None
-        for pool in potential_pools:
-            is_wsol_pair = False
-            base_mint = pool.get('baseMint')
-            quote_mint = pool.get('quoteMint')
-
-            if (base_mint == target_mint and quote_mint == wsol_mint) or \
-               (base_mint == wsol_mint and quote_mint == target_mint):
-                is_wsol_pair = True
-
-            # --- Key Validation (#2 Implemented Here) ---
-            missing_keys = [key for key in POOL_INFO_REQUIRED_KEYS if key not in pool or not pool[key]]
-            if missing_keys:
-                logger.debug(f"Pool {pool.get('id')} for {target_mint} is missing required keys: {missing_keys}. Skipping.")
-                continue # Skip this pool, it's unusable for V4 swap
-
-            # If it's a WSOL pair and valid, prioritize it
-            if is_wsol_pair:
-                logger.info(f"Found VALID WSOL pair pool for {target_mint}: {pool.get('id')}")
-                best_pool_info = pool
-                break # Found the best option
-
-            # If no WSOL pair found yet, keep the first valid pool as a fallback
-            if best_pool_info is None:
-                 logger.debug(f"Found valid non-WSOL pool for {target_mint}: {pool.get('id')}. Keeping as fallback.")
-                 best_pool_info = pool
-        # --- End Validation ---
-
-        if best_pool_info is None:
-            logger.warning(f"Could not find a VALID Raydium pool with all required keys for token {target_mint}.")
-            return None
-
-        # Return a structured dictionary using expected keys
-        # (Renaming API keys slightly for consistency if desired, but using API keys directly is fine)
-        return {
-            "amm_id": best_pool_info.get('id'),
-            "amm_authority": best_pool_info.get('authority'),
-            "base_mint": best_pool_info.get('baseMint'),
-            "quote_mint": best_pool_info.get('quoteMint'),
-            "lp_mint": best_pool_info.get('lpMint'),
-            "base_vault": best_pool_info.get('baseVault'),
-            "quote_vault": best_pool_info.get('quoteVault'),
-            "market_id": best_pool_info.get('marketId'),
-            "open_orders": best_pool_info.get('openOrders'),
-            "market_base_vault": best_pool_info.get('marketBaseVault'),
-            "market_quote_vault": best_pool_info.get('marketQuoteVault'),
-            "market_authority": best_pool_info.get('marketAuthority'),
-            "market_bids": best_pool_info.get('marketBids'),
-            "market_asks": best_pool_info.get('marketAsks'),
-            "market_event_queue": best_pool_info.get('marketEventQueue'),
-            "version": best_pool_info.get('version', 4) # Assume V4
-        }
+                logger.error(f"Error creating RaydiumPoolInfo for {pool_data.get('id', 'N/A')}: {e}", exc_info=True)
+        # ... (logging and return found_pools) ...
+        if not found_pools:
+            logger.info(f"No suitable Raydium pool found for token {token_mint_str}")
+        elif len(found_pools) > 1:
+            logger.info(f"Found {len(found_pools)} pools for {token_mint_str}. Prioritizing: {found_pools[0]}")
+        return found_pools
 
 
 class RaydiumSwapWrapper:
-    """Builds Raydium AMM V4 swap instructions with amount calculation."""
+    """Builds instructions for Raydium V4 swaps."""
 
-    def __init__(self):
+    def __init__(self, client: SolanaClient):
+        self.client = client
         logger.info("RaydiumSwapWrapper initialized.")
 
-    async def _get_vault_balances(self, client: SolanaClient, base_vault_pk: Pubkey, quote_vault_pk: Pubkey) -> Optional[Tuple[int, int]]:
-        """Fetches token balances for base and quote vaults concurrently."""
-        logger.debug(f"Fetching vault balances: Base={base_vault_pk}, Quote={quote_vault_pk}")
-        try:
-            opts = TokenAccountOpts(encoding="jsonParsed") # Or "base64" and decode manually
-            # Fetch concurrently
-            results = await asyncio.gather(
-                client.get_async_client().get_token_account_balance(base_vault_pk, commitment="confirmed"),
-                client.get_async_client().get_token_account_balance(quote_vault_pk, commitment="confirmed"),
-                return_exceptions=True # Allow one to fail without stopping the other
-            )
-
-            base_resp, quote_resp = results
-
-            if isinstance(base_resp, Exception) or not hasattr(base_resp, 'value') or base_resp.value is None:
-                logger.error(f"Failed to get base vault balance ({base_vault_pk}): {base_resp}")
-                return None
-            if isinstance(quote_resp, Exception) or not hasattr(quote_resp, 'value') or quote_resp.value is None:
-                logger.error(f"Failed to get quote vault balance ({quote_vault_pk}): {quote_resp}")
-                return None
-
-            base_balance = int(base_resp.value.amount)
-            quote_balance = int(quote_resp.value.amount)
-            logger.debug(f"Vault balances fetched: Base={base_balance}, Quote={quote_balance}")
-            return base_balance, quote_balance
-
-        except Exception as e:
-            logger.error(f"Error fetching vault balances: {e}", exc_info=True)
-            return None
-
-    def _calculate_amount_out(self, reserve_in: int, reserve_out: int, amount_in: int) -> int:
-        """Calculates the expected amount out based on reserves and input, accounting for Raydium fee."""
-        if reserve_in <= 0 or reserve_out <= 0 or amount_in <= 0:
-            return 0
-
-        # Apply fee to input amount (Raydium takes 0.25%)
-        amount_in_post_fee = (amount_in * INPUT_AMOUNT_RETAIN_NUMERATOR) // INPUT_AMOUNT_RETAIN_DENOMINATOR
-
-        # Calculate amount out using constant product formula on post-fee input
-        numerator = reserve_out * amount_in_post_fee
-        denominator = reserve_in + amount_in_post_fee
-
-        if denominator == 0: return 0 # Avoid division by zero
-
-        amount_out = numerator // denominator
-        return int(amount_out) # Ensure integer result (lamports)
-
+    async def _get_serum_market_accounts(self, market_id: Pubkey) -> Optional[Dict[str, Pubkey]]:
+        """Fetches and parses Serum market state to find necessary accounts."""
+        logger.info(f"Fetching Serum market state for {market_id}...")
+        # This requires implementing Serum market state parsing (complex)
+        # Or using a library that does it (e.g., Serum-py if available/updated)
+        # Placeholder: Return None for now, indicating fetching is needed
+        # In a real implementation:
+        # market_account_info = await self.client.get_account_info(market_id)
+        # if market_account_info and market_account_info.value:
+        #     parsed_market_state = parse_serum_market_state(market_account_info.value.data) # Needs parser
+        #     if parsed_market_state:
+        #         return {
+        #             "serum_bids": parsed_market_state.bids,
+        #             "serum_asks": parsed_market_state.asks,
+        #             "serum_event_queue": parsed_market_state.event_queue,
+        #             # serum_base_vault, serum_quote_vault should be available from Raydium API info
+        #             # serum_vault_signer needs derivation (PDA: [market_id bytes, vault_signer_nonce bytes])
+        #         }
+        logger.warning(f"Serum market account fetching for {market_id} is not implemented.")
+        return None  # Indicate accounts need fetching / parsing
 
     async def build_swap_instructions(
-        self,
-        client: SolanaClient, # Pass the client object
-        pool_info: Dict[str, Any],
-        input_mint: Pubkey,
-        output_mint: Pubkey, # Typically WSOL when selling
-        amount_in: int,
-        slippage_bps: int,
-        owner_pubkey: Pubkey
-    ) -> Optional[List[Instruction]]:
-        """
-        Builds the Raydium AMM V4 swap instruction, including min_amount_out calculation.
-        """
-        logger.debug(f"Building Raydium swap: {amount_in} lamports of {input_mint} for {output_mint} in pool {pool_info.get('amm_id')}")
+            self,
+            pool_info: RaydiumPoolInfo,
+            owner_keypair: Keypair,  # Use Keypair type hint
+            token_in_mint: Pubkey,
+            token_out_mint: Pubkey,
+            amount_in_lamports: int,
+            min_amount_out_lamports: int,
+    ) -> List[Instruction]:
 
-        # --- Pool Info Validation (Done by Fetcher, but double-check is cheap) ---
-        missing_keys = [key for key in POOL_INFO_REQUIRED_KEYS if key not in pool_info or not pool_info[key]]
-        if missing_keys:
-            logger.error(f"Cannot build swap: Missing required pool_info keys: {missing_keys}. Pool data from fetcher was invalid.")
-            return None
+        instructions: List[Instruction] = []
+        owner_pubkey = owner_keypair.pubkey()
 
-        # --- Determine Base/Quote relative to Input/Output & Get Vault Pks ---
-        base_vault_pk = Pubkey.from_string(pool_info["base_vault"])
-        quote_vault_pk = Pubkey.from_string(pool_info["quote_vault"])
-        pool_base_mint_str = pool_info["base_mint"]
-        pool_quote_mint_str = pool_info["quote_mint"]
-        input_mint_str = str(input_mint)
+        user_source_ata = InstructionBuilder.get_associated_token_address(owner_pubkey, token_in_mint)
+        user_destination_ata = InstructionBuilder.get_associated_token_address(owner_pubkey, token_out_mint)
 
-        if input_mint_str == pool_base_mint_str:
-            reserve_in_vault = base_vault_pk
-            reserve_out_vault = quote_vault_pk
-            logger.debug("Input is BASE token")
-        elif input_mint_str == pool_quote_mint_str:
-            reserve_in_vault = quote_vault_pk
-            reserve_out_vault = base_vault_pk
-            logger.debug("Input is QUOTE token")
-        else:
-            logger.error(f"Input mint {input_mint} does not match pool's base ({pool_base_mint_str}) or quote ({pool_quote_mint_str}) mint.")
-            return None
+        dest_ata_info = await self.client.get_account_info(user_destination_ata)
+        if dest_ata_info is None or dest_ata_info.value is None:
+            logger.info(f"Destination ATA {user_destination_ata} for swap does not exist. Adding create instruction.")
+            create_dest_ata_ix = InstructionBuilder.get_create_ata_instruction(
+                payer=owner_pubkey, owner=owner_pubkey, mint=token_out_mint, ata_pubkey=user_destination_ata
+            )
+            instructions.append(create_dest_ata_ix)
 
-        # --- Fetch Live Vault Balances (#1 - Fetching Reserves) ---
-        balances = await self._get_vault_balances(client, reserve_in_vault, reserve_out_vault)
-        if balances is None:
-            logger.error("Failed to fetch vault balances, cannot calculate amount out.")
-            return None
-        reserve_in_balance, reserve_out_balance = balances
+        # --- Get Required Serum Market Accounts ---
+        serum_market_pk = Pubkey.from_string(pool_info.market_id)
+        serum_bids_pk = Pubkey.from_string(pool_info.extra_data.get("serum_bids")) if pool_info.extra_data.get(
+            "serum_bids") else None
+        serum_asks_pk = Pubkey.from_string(pool_info.extra_data.get("serum_asks")) if pool_info.extra_data.get(
+            "serum_asks") else None
+        serum_event_queue_pk = Pubkey.from_string(
+            pool_info.extra_data.get("serum_event_queue")) if pool_info.extra_data.get("serum_event_queue") else None
+        serum_vault_signer_pk = Pubkey.from_string(
+            pool_info.extra_data.get("serum_vault_signer")) if pool_info.extra_data.get("serum_vault_signer") else None
 
-        # --- Calculate Expected Amount Out (#1 - Calculation) ---
-        expected_amount_out = self._calculate_amount_out(reserve_in_balance, reserve_out_balance, amount_in)
-        if expected_amount_out <= 0:
-            logger.error(f"Calculated expected_amount_out is zero or negative ({expected_amount_out}) based on reserves {reserve_in_balance}/{reserve_out_balance} and input {amount_in}. Check calculation or reserves.")
-            # Allow proceeding with min_amount_out = 0? Or fail? Failing is safer.
-            return None
-        logger.debug(f"Calculated expected amount out (post-fee): {expected_amount_out}")
+        # If essential serum accounts are missing, attempt to fetch/derive them
+        # This is a complex step requiring Serum market state parsing.
+        if not all([serum_bids_pk, serum_asks_pk, serum_event_queue_pk, serum_vault_signer_pk]):
+            logger.warning(
+                f"Essential Serum market accounts missing for market {serum_market_pk}. Swap may fail if not fetched/derived.")
+            # fetched_serum_accounts = await self._get_serum_market_accounts(serum_market_pk)
+            # if fetched_serum_accounts:
+            #     serum_bids_pk = fetched_serum_accounts['serum_bids']
+            #     # ... etc ...
+            # else:
+            raise ValueError(
+                f"Cannot proceed with swap for pool {pool_info.id}: Missing critical Serum market accounts (bids, asks, event_q, vault_signer). Implement fetching/parsing.")
 
-        # --- Apply Slippage (#1 - Slippage) ---
-        # slippage_bps is in basis points (e.g., 50 = 0.5%)
-        min_amount_out = math.floor(expected_amount_out * (10000 - slippage_bps) / 10000)
+        # Use optional chaining for market vaults, providing a default invalid Pubkey if None
+        # This assumes make_swap_instruction can handle potentially invalid pubkeys if the market program isn't Serum V3
+        default_pk = Pubkey.from_string("11111111111111111111111111111111")  # Placeholder
+        serum_base_vault_pk = Pubkey.from_string(
+            pool_info.market_base_vault) if pool_info.market_base_vault else default_pk
+        serum_quote_vault_pk = Pubkey.from_string(
+            pool_info.market_quote_vault) if pool_info.market_quote_vault else default_pk
 
-        if min_amount_out < 0: min_amount_out = 0 # Should not happen if expected > 0
-        logger.info(f"Calculated min_amount_out (slippage {slippage_bps/100}%): {min_amount_out}")
+        # Determine pool vaults based on swap direction
+        pool_base_vault_pk = Pubkey.from_string(pool_info.base_vault)
+        pool_quote_vault_pk = Pubkey.from_string(pool_info.quote_vault)
 
-        if amount_in <= 0:
-            logger.error("Amount in must be positive.")
-            return None
+        pool_vault_in = pool_base_vault_pk if token_in_mint == Pubkey.from_string(
+            pool_info.base_mint) else pool_quote_vault_pk
+        pool_vault_out = pool_quote_vault_pk if token_out_mint == Pubkey.from_string(
+            pool_info.quote_mint) else pool_base_vault_pk
 
-        # --- Get User ATAs ---
-        user_source_ata = get_associated_token_address(owner_pubkey, input_mint)
-        user_destination_ata = get_associated_token_address(owner_pubkey, output_mint)
-
-        # --- Instruction Data ---
-        SWAP_DISCRIMINATOR = 9
-        instruction_data = struct.pack("<BQQ", SWAP_DISCRIMINATOR, amount_in, min_amount_out) # Use calculated min_amount_out
-
-        # --- Account Metas (Order verified as standard for V4) ---
-        accounts = [
-            AccountMeta(pubkey=SolanaProgramAddresses.TOKEN_PROGRAM_ID, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["amm_id"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["amm_authority"]), is_signer=False, is_writable=False),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["open_orders"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["amm_id"]), is_signer=False, is_writable=True), # Target Orders = AMM ID (Standard)
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["base_vault"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["quote_vault"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=SERUM_DEX_PROGRAM_ID, is_signer=False, is_writable=False),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["market_id"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["market_bids"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["market_asks"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["market_event_queue"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["market_base_vault"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["market_quote_vault"]), is_signer=False, is_writable=True),
-            AccountMeta(pubkey=Pubkey.from_string(pool_info["market_authority"]), is_signer=False, is_writable=False),
-            AccountMeta(pubkey=user_source_ata, is_signer=False, is_writable=True),
-            AccountMeta(pubkey=user_destination_ata, is_signer=False, is_writable=True),
-            AccountMeta(pubkey=owner_pubkey, is_signer=True, is_writable=False),
-        ]
-
-        swap_instruction = Instruction(
-            program_id=RAYDIUM_LP_V4_PROGRAM_ID,
-            data=instruction_data,
-            accounts=accounts
+        swap_accounts = SwapAccounts(
+            token_program=SolanaProgramAddresses.TOKEN_PROGRAM_ID,
+            amm=pool_info.amm_id,
+            amm_authority=Pubkey.from_string(pool_info.amm_authority),
+            amm_open_orders=Pubkey.from_string(pool_info.open_orders),
+            # Raydium V4 often uses the same account for target_orders as open_orders
+            amm_target_orders=Pubkey.from_string(pool_info.target_orders),
+            pool_coin_token_account=pool_base_vault_pk,  # Use base/quote designation consistently
+            pool_pc_token_account=pool_quote_vault_pk,  # Use base/quote designation consistently
+            serum_program=Pubkey.from_string(
+                pool_info.market_program_id or "srmqPvymJeFKQ4zGQed1GFppgkRHL9kaELCbyksJtPX"),
+            serum_market=serum_market_pk,
+            serum_bids=serum_bids_pk,
+            serum_asks=serum_asks_pk,
+            serum_event_queue=serum_event_queue_pk,
+            serum_coin_vault_account=serum_base_vault_pk,
+            serum_pc_vault_account=serum_quote_vault_pk,
+            serum_vault_signer=serum_vault_signer_pk,
+            user_source_token_account=user_source_ata,
+            user_destination_token_account=user_destination_ata,
+            user_source_owner=owner_pubkey,
         )
 
-        instructions = []
+        swap_args = SwapArgs(
+            amount_in=amount_in_lamports,
+            min_amount_out=min_amount_out_lamports
+        )
 
-        # --- Check if Destination ATA needs creation ---
-        if output_mint != WSOL_ADDRESS: # Don't need to create WSOL ATA
-            try:
-                logger.debug(f"Checking if destination ATA {user_destination_ata} exists for mint {output_mint}")
-                # Use the passed client instance
-                acc_info_resp = await client.get_async_client().get_account_info(user_destination_ata, commitment="confirmed")
-                if acc_info_resp.value is None:
-                    logger.info(f"Destination ATA {user_destination_ata} does not exist. Adding create instruction.")
-                    create_dest_ata_ix = create_associated_token_account(
-                        payer=owner_pubkey,
-                        owner=owner_pubkey,
-                        mint=output_mint
-                    )
-                    instructions.append(create_dest_ata_ix)
-            except Exception as e:
-                 logger.error(f"Failed to check destination ATA {user_destination_ata} existence: {e}. Tx might fail if it doesn't exist.")
-                 # Decide whether to fail the build or proceed cautiously
-                 # return None # Safer to fail if check fails
+        # Call the function imported from src.core.raydium_amm_v4
+        swap_ix = make_swap_instruction(
+            program_id=Pubkey.from_string(pool_info.program_id),
+            accounts=swap_accounts,
+            args=swap_args
+        )
+        instructions.append(swap_ix)
 
-        instructions.append(swap_instruction)
-
-        # --- SOL/WSOL Handling ---
-        # Since we are selling TO WSOL, we primarily need the WSOL ATA to exist.
-        # If we were selling FROM SOL, wrapping instructions would be needed here.
-        # If we wanted native SOL output, unwrapping instructions would be needed AFTER the swap.
-
-        logger.info(f"Successfully built Raydium swap instruction(s) for pool {pool_info.get('amm_id')}")
         return instructions

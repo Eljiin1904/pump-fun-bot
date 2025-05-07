@@ -1,234 +1,202 @@
 # src/trading/seller.py
-
 import asyncio
-from typing import Optional, Any, List, Sequence # Added Sequence
-
+from typing import Optional, List
+from solders.instruction import Instruction
 from solders.pubkey import Pubkey
 
-from solders.compute_budget import set_compute_unit_price, set_compute_unit_limit
-from solders.signature import Signature
-from solders.instruction import Instruction
-# --- FIX: Use Solders commitment type ---
-from solders.commitment_config import CommitmentLevel
-from solders.transaction_status import TransactionConfirmationStatus
-# --- END FIX ---
-from solana.rpc.commitment import Confirmed # Keep for balance check if needed by client helper
-
-# --- Project Imports ---
-from ..core.client import SolanaClient
-from ..core.curve import BondingCurveManager, BondingCurveState, LAMPORTS_PER_SOL, DEFAULT_TOKEN_DECIMALS
-from ..core.priority_fee.manager import PriorityFeeManager
-from ..core.wallet import Wallet
-from ..core.transactions import build_and_send_transaction, TransactionResult
-from ..core.instruction_builder import InstructionBuilder
-from ..trading.base import TokenInfo, TradeResult
-from ..utils.logger import get_logger
+from core.pubkeys import PumpAddresses
+from src.core.client import SolanaClient
+from src.core.wallet import Wallet
+from src.core.curve import BondingCurveManager, BondingCurveState, LAMPORTS_PER_SOL
+from src.core.priority_fee.manager import PriorityFeeManager
+from src.core.transactions import build_and_send_transaction, TransactionSendResult, get_transaction_fee  # NEW
+from src.core.instruction_builder import InstructionBuilder
+from src.trading.base import TokenInfo, TradeResult
+from src.utils.logger import get_logger
+from solana.rpc.commitment import Confirmed, Processed  # Added Processed
 
 logger = get_logger(__name__)
 
-FETCH_RETRY_DELAY_SECONDS = 4.0
-DEFAULT_COMPUTE_UNIT_LIMIT_SELL = 150_000
-# --- FIX: Use Solders CommitmentLevel ---
-DEFAULT_SELL_COMMITMENT = CommitmentLevel.Confirmed # Use Confirmed for sells
-# --- END FIX ---
-
 
 class TokenSeller:
-    """ Handles the logic for selling tokens back to the pump.fun bonding curve. """
-
     def __init__(
-        self,
-        client: SolanaClient,
-        wallet: Wallet,
-        curve_manager: BondingCurveManager,
-        priority_fee_manager: PriorityFeeManager,
-        slippage: float, # Decimal, e.g. 0.002 for 0.2%
-        max_retries: int,
-        confirm_timeout: int,
-        compute_unit_limit: int = DEFAULT_COMPUTE_UNIT_LIMIT_SELL
+            self,
+            client: SolanaClient,
+            wallet: Wallet,
+            curve_manager: BondingCurveManager,
+            fee_manager: PriorityFeeManager,
+            slippage_bps: int,
+            max_retries: int,
+            confirm_timeout_seconds: int,
+            priority_fee_cu_limit: int = 200_000,
+            priority_fee_cu_price: Optional[int] = None
     ):
         self.client = client
         self.wallet = wallet
         self.curve_manager = curve_manager
-        self.priority_fee_manager = priority_fee_manager
-        self.slippage_decimal = slippage
+        self.fee_manager = fee_manager
+        self.slippage_bps = slippage_bps
         self.max_retries = max_retries
-        self.confirm_timeout = confirm_timeout
-        self.compute_unit_limit = compute_unit_limit
-        logger.info(f"TokenSeller Init: Slip={self.slippage_decimal*100:.1f}%, MaxRetries={self.max_retries}, CULimit={self.compute_unit_limit}")
+        self.confirm_timeout_seconds = confirm_timeout_seconds
+        self.priority_fee_cu_limit = priority_fee_cu_limit
+        self.priority_fee_cu_price = priority_fee_cu_price
+        logger.info(
+            f"TokenSeller Init: SlipBPS={self.slippage_bps}, MaxRetries={self.max_retries}, CU Limit={self.priority_fee_cu_limit}")
 
-    # --- Helper to get balance (assuming client doesn't have it) ---
-    async def _get_balance_lamports(self, token_account_pubkey: Pubkey) -> Optional[int]:
-        """ Safely fetches token balance in lamports. """
+    def _calculate_min_sol_out(self, curve_state: BondingCurveState, tokens_to_sell_lamports: int,
+                               token_symbol: str) -> int:
+        # ... (implementation from previous response) ...
+        if tokens_to_sell_lamports <= 0: return 0
+        estimated_sol_out_lamports = curve_state.estimate_sol_out_for_tokens(tokens_to_sell_lamports)
+        if estimated_sol_out_lamports <= 0:
+            logger.warning(f"Sell Estimation for {token_symbol}: Estimated SOL out is {estimated_sol_out_lamports} ...")
+            return 0
+        min_sol_out = int(estimated_sol_out_lamports * (1 - (self.slippage_bps / 10000.0)))
+        logger.info(
+            f"Sell Estimation for {token_symbol}: TokensIn={tokens_to_sell_lamports}, Est.SOL_Out={estimated_sol_out_lamports}, MinSOLOut ...={min_sol_out}")
+        return min_sol_out
+
+    async def _get_sol_balance(self, account_pubkey: Pubkey) -> int:
+        """Helper to get SOL balance, returns 0 on error."""
         try:
-            # Use Confirmed commitment for balance check before selling
-            balance_resp = await self.client.get_token_account_balance(token_account_pubkey, commitment=Confirmed)
-            if balance_resp and hasattr(balance_resp, 'amount'):
-                return int(balance_resp.amount)
-            else:
-                logger.warning(f"Could not get valid balance object for {token_account_pubkey}.")
-                return None # Indicate failure to get balance object
+            balance_resp = await self.client.get_balance(account_pubkey,
+                                                         commitment=Processed)  # Use Processed for faster balance checks
+            if balance_resp and balance_resp.value is not None:  # get_balance returns RpcResponseContext(RpcContext, int)
+                return balance_resp.value
         except Exception as e:
-            logger.error(f"Error fetching balance for {token_account_pubkey}: {e}", exc_info=True)
-            return None # Indicate error during fetch
+            logger.warning(f"Could not fetch SOL balance for {account_pubkey}: {e}")
+        return 0
 
-    async def execute(self, token_info: TokenInfo, buyer_result: Optional[TradeResult] = None) -> TradeResult:
-        """ Attempts to sell the user's entire balance of the specified token. """
-        mint_str = str(token_info.mint)
-        logger.info(f"Attempting sell for {token_info.symbol} ({mint_str[:6]})...")
+    async def execute(self, token_info: TokenInfo, tokens_to_sell_lamports: int) -> TradeResult:
+        logger.info(
+            f"Attempting sell of {tokens_to_sell_lamports} lamports of {token_info.symbol} ({token_info.mint_str})")
 
-        user_pubkey = self.wallet.pubkey
-        mint_pubkey = token_info.mint
-        user_token_account = Wallet.get_associated_token_address(user_pubkey, mint_pubkey)
+        # ... (initial checks for tokens_to_sell, user_ata_balance, curve_state from previous response) ...
+        if tokens_to_sell_lamports <= 0:  # From previous
+            return TradeResult(token_info=token_info, success=False, error="Invalid token amount for selling")
+        user_ata_pubkey = InstructionBuilder.get_associated_token_address(self.wallet.pubkey, token_info.mint)
+        try:  # From previous
+            ata_balance_resp = await self.client.get_token_account_balance(user_ata_pubkey, commitment=Processed)
+            if ata_balance_resp is None or ata_balance_resp.value is None or int(
+                    ata_balance_resp.value.amount) < tokens_to_sell_lamports:
+                return TradeResult(token_info=token_info, success=False, error="Insufficient token balance for sell")
+        except Exception as e:
+            return TradeResult(token_info=token_info, success=False, error="Failed to verify token balance")
+        if not token_info.bonding_curve_address:  # From previous
+            return TradeResult(token_info=token_info, success=False, error="Missing bonding_curve_address for sell")
+        curve_state = await self.curve_manager.get_curve_state(token_info.bonding_curve_address)
+        if not curve_state:
+            return TradeResult(token_info=token_info, success=False,
+                               error="Failed to fetch bonding curve state for sell")
+        liquidity_at_sell_attempt_lamports = curve_state.virtual_sol_reserves
+        # ...
 
-        # --- 1. Get Current Balance ---
-        amount_to_sell_lamports = await self._get_balance_lamports(user_token_account)
+        min_sol_out_lamports = self._calculate_min_sol_out(curve_state, tokens_to_sell_lamports, token_info.symbol)
+        if min_sol_out_lamports <= 0 and tokens_to_sell_lamports > 0:
+            return TradeResult(token_info=token_info, success=False, error="Min SOL out calculation failed",
+                               initial_sol_liquidity=liquidity_at_sell_attempt_lamports)
 
-        if amount_to_sell_lamports is None:
-            # Error logged in _get_balance_lamports
-            return TradeResult(success=False, error_message="Failed to fetch token balance", error_type="BalanceError")
-        if amount_to_sell_lamports <= 0:
-            logger.warning(f"Sell {token_info.symbol}: Balance is zero. Cannot sell.")
-            return TradeResult(success=False, error_message="Zero balance", amount=0, error_type="BalanceError")
+        tx_result: Optional[TransactionSendResult] = None
 
-        logger.info(f"Attempting to sell {amount_to_sell_lamports} lamports of {token_info.symbol}.")
+        # Get SOL balance BEFORE the transaction
+        sol_balance_before_lamports = await self._get_sol_balance(self.wallet.pubkey)
+        logger.info(f"SOL balance for {self.wallet.pubkey} BEFORE sell: {sol_balance_before_lamports}")
 
-        # --- Sell Retry Loop ---
-        retry_count = 0
-        error_message = "Max sell retries reached"
-        last_exception: Optional[Exception] = None
-
-        while retry_count < self.max_retries:
-            retry_count += 1
-            logger.info(f"Sell attempt {retry_count}/{self.max_retries} for {token_info.symbol}")
-            last_exception = None # Reset for this attempt
-
+        for attempt in range(self.max_retries):
+            # ... (instruction building logic from previous response: priority fees, sell_ix) ...
+            logger.info(f"Sell attempt {attempt + 1}/{self.max_retries} for {token_info.symbol}")
+            instructions: List[Instruction] = []
             try:
-                # --- 2. Derive PDAs ---
-                try:
-                    bonding_curve_pubkey, _ = BondingCurveManager.find_bonding_curve_pda(mint_pubkey)
-                    associated_bonding_curve_pubkey, _ = BondingCurveManager.find_associated_bonding_curve_pda(mint_pubkey)
-                    logger.debug(f"Sell using Curve PDA: {bonding_curve_pubkey}, Vault PDA: {associated_bonding_curve_pubkey}")
-                except Exception as pda_e:
-                    logger.error(f"SELLER: Failed PDA derivation {mint_pubkey}: {pda_e}")
-                    error_message = "Failed PDA derivation during sell"; break # Unrecoverable
-
-                # --- 3. Get Curve State ---
-                # --- FIX: Use correct commitment type ---
-                curve_state: Optional[BondingCurveState] = await self.curve_manager.get_curve_state(
-                    bonding_curve_pubkey,
-                    commitment=DEFAULT_SELL_COMMITMENT # Use Confirmed
-                    # Or pass None: commitment=None
-                )
-                # --- END FIX ---
-                if not curve_state:
-                    logger.warning(f"Sell attempt {retry_count}: Could not get curve state. Retrying after delay...")
-                    await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS); continue
-
-                # --- 4. Calculate Min Output ---
-                est_sol_out_lamports: int = 0
-                min_sol_output_lamports: int = 0
-                try:
-                    est_sol_out_lamports = curve_state.calculate_sol_out_for_tokens(amount_to_sell_lamports)
-                    min_sol_output_lamports = int(est_sol_out_lamports * (1 - self.slippage_decimal))
-                    min_sol_output_lamports = max(0, min_sol_output_lamports) # Ensure non-negative
-                    logger.debug(f"Est SOL Out: {est_sol_out_lamports}, MinSOLOut (Slippage): {min_sol_output_lamports}")
-                    # Check if estimated output is reasonable (e.g., not negative if curve depleted)
-                    if est_sol_out_lamports < 0:
-                         logger.warning(f"Sell attempt {retry_count}: Estimated SOL out is negative. Curve may be depleted.")
-                         error_message = "Sell failed: Negative estimated SOL output."
-                         break # Exit loop if calculation seems invalid
-                except Exception as calc_e:
-                    logger.error(f"Error calculating sell output for {token_info.symbol}: {calc_e}", exc_info=True)
-                    error_message = "Sell calculation error"
-                    await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS); continue
-
-                # --- 5. Calculate Priority Fee ---
-                compute_unit_price_micro_lamports = 0
-                # --- FIX: Define target accounts for seller fee ---
-                priority_fee_target_accounts: List[Pubkey] = [
-                    mint_pubkey,
-                    bonding_curve_pubkey,
-                    associated_bonding_curve_pubkey,
-                    user_token_account,
+                fee_check_accounts = [
+                    PumpAddresses.GLOBAL_STATE, PumpAddresses.FEE_RECIPIENT, token_info.mint,
+                    token_info.bonding_curve_address, token_info.associated_bonding_curve_address,
+                    user_ata_pubkey, self.wallet.pubkey
                 ]
-                # --- END FIX ---
-                try:
-                    # --- FIX: Pass target accounts ---
-                    fee = await self.priority_fee_manager.calculate_priority_fee(accounts=priority_fee_target_accounts)
-                    # --- END FIX ---
-                    if fee is not None and fee > 0:
-                        compute_unit_price_micro_lamports = int(fee)
-                        logger.info(f"Using priority fee for sell: {compute_unit_price_micro_lamports} micro-lamports")
-                    elif fee == 0: logger.info("Priority Fee Manager returned 0 for sell. Using 0.")
-                    else: logger.warning("Priority Fee Manager returned None for sell. Using 0 micro-lamports.")
-                except AttributeError as fee_attr_err: logger.error(f"PriorityFeeManager missing attribute/method? {fee_attr_err}. Using 0 fee.", exc_info=True)
-                except Exception as fee_e: logger.error(f"Error calculating priority fee for sell: {fee_e}. Using 0.", exc_info=True)
+                priority_fee_details = await self.fee_manager.get_priority_fee(accounts_to_check=fee_check_accounts)
+                cu_limit_actual = self.priority_fee_cu_limit
+                cu_price_actual = self.priority_fee_cu_price if self.priority_fee_cu_price is not None \
+                    else (priority_fee_details.fee if priority_fee_details else 1)
+                if cu_limit_actual: instructions.append(InstructionBuilder.set_compute_unit_limit(cu_limit_actual))
+                if cu_price_actual: instructions.append(InstructionBuilder.set_compute_unit_price(cu_price_actual))
 
-                # --- 6. Build Instructions ---
-                instructions: List[Instruction] = []
-                instructions.append(set_compute_unit_limit(self.compute_unit_limit))
-                if compute_unit_price_micro_lamports > 0:
-                     instructions.append(set_compute_unit_price(compute_unit_price_micro_lamports))
-
-                sell_instruction = InstructionBuilder.get_pump_sell_instruction(
-                    user_pubkey=user_pubkey, mint_pubkey=mint_pubkey,
-                    bonding_curve_pubkey=bonding_curve_pubkey,
-                    associated_bonding_curve_pubkey=associated_bonding_curve_pubkey,
-                    user_token_account=user_token_account,
-                    token_amount=amount_to_sell_lamports,
-                    min_sol_output=min_sol_output_lamports
+                sell_ix = InstructionBuilder.build_pump_fun_sell_instruction(
+                    user_wallet_pubkey=self.wallet.pubkey, mint_pubkey=token_info.mint,
+                    bonding_curve_pubkey=token_info.bonding_curve_address,
+                    assoc_bonding_curve_token_account_pubkey=token_info.associated_bonding_curve_address,
+                    token_amount_in_lamports=tokens_to_sell_lamports,
+                    min_sol_output_lamports=min_sol_out_lamports
                 )
-                if sell_instruction is None:
-                    error_message = "Failed to build sell instruction. Stopping retries."; logger.error(error_message); break
-                instructions.append(sell_instruction)
+                instructions.append(sell_ix)
 
-                # --- 7. Send and Confirm ---
-                tx_result: TransactionResult = await build_and_send_transaction(
-                    client=self.client,
-                    payer=self.wallet.payer,
-                    instructions=instructions,
-                    label=f"Sell_{token_info.symbol[:5]}",
-                    confirm=True,
-                    confirm_timeout_secs=self.confirm_timeout,
-                    confirm_commitment="confirmed" # Confirm sells to 'confirmed'
+                tx_result = await build_and_send_transaction(
+                    client=self.client, wallet_keypair=self.wallet.keypair, instructions=instructions,
+                    signers=[self.wallet.keypair], log_prefix=f"Sell_{token_info.symbol[:5]}",
+                    commitment=Confirmed, confirm_timeout_seconds=self.confirm_timeout_seconds,
+                    max_send_retries=1
                 )
-
-                # --- 8. Process Result ---
-                if tx_result.success and tx_result.signature:
-                    logger.info(f"Sell tx CONFIRMED: {tx_result.signature}")
-                    sell_price_sol_per_token_estimate = 0.0
-                    token_decimals = token_info.decimals if token_info.decimals is not None else DEFAULT_TOKEN_DECIMALS
-                    # Calculate estimated price based on estimated SOL out
-                    if amount_to_sell_lamports > 0 and token_decimals is not None:
-                         try:
-                             amount_ui = amount_to_sell_lamports / (10**token_decimals)
-                             if amount_ui > 0:
-                                 sell_price_sol_per_token_estimate = (est_sol_out_lamports / LAMPORTS_PER_SOL) / amount_ui
-                         except ZeroDivisionError: pass
-                    return TradeResult(
-                        success=True,
-                        tx_signature=tx_result.signature,
-                        price=sell_price_sol_per_token_estimate,
-                        amount=(est_sol_out_lamports / LAMPORTS_PER_SOL), # Log estimated SOL received
-                        initial_sol_liquidity=None # Not relevant for sell result
-                    )
-                else: # Send or confirm failed
-                    error_message = f"Sell tx failed ({tx_result.error_type}): {tx_result.error_message or 'No specific message'}"
-                    logger.warning(f"{error_message}. Retrying attempt {retry_count+1}...")
-                    last_exception = RuntimeError(error_message)
-                    await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS + retry_count); continue # Delay and retry
-
+            # ... (exception handling from previous response) ...
             except Exception as e:
-                last_exception = e
-                error_message = f"Unexpected error during sell attempt {retry_count}: {e}"
-                logger.error(error_message, exc_info=True)
-                if "Failed to build sell instruction" in str(e): break # Unrecoverable build error
-                # Delay before next attempt
-                if retry_count < self.max_retries:
-                    await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS + retry_count * 2) # Longer backoff
-                # continue is implicit
+                error_msg = f"Exception during sell attempt {attempt + 1} for {token_info.symbol}: {str(e)}"
+                logger.error(error_msg, exc_info=True)
+                tx_result = TransactionSendResult(success=False, error=error_msg)
+                # No break here, let retry logic handle it
 
-        # --- End of Retry Loop ---
-        logger.error(f"Failed sell {token_info.symbol} after {self.max_retries} attempts. Last error: {error_message}")
-        return TradeResult(success=False, error_message=error_message, amount=0.0, price=0.0, error_type="MaxRetriesReached" if not last_exception else type(last_exception).__name__)
+            if tx_result and tx_result.success and tx_result.signature:
+                logger.info(
+                    f"SELL_SUCCESS_SENT: {token_info.symbol}. Tx: {tx_result.signature}. Confirming and fetching actual SOL balance...")
+
+                # Wait for state propagation or use confirmation status
+                await asyncio.sleep(2.0)
+
+                sol_balance_after_lamports = await self._get_sol_balance(self.wallet.pubkey)
+                logger.info(f"SOL balance for {self.wallet.pubkey} AFTER sell: {sol_balance_after_lamports}")
+
+                # Get the actual fee paid for THIS transaction
+                tx_fee_lamports = 0
+                if tx_result.signature:  # Ensure we have a signature
+                    fee_info = await get_transaction_fee(self.client, tx_result.signature)  # Needs this utility
+                    if fee_info is not None:
+                        tx_fee_lamports = fee_info
+                        logger.info(f"Actual fee for sell tx {tx_result.signature}: {tx_fee_lamports} lamports")
+                    else:
+                        logger.warning(
+                            f"Could not retrieve fee for sell tx {tx_result.signature}. SOL gained will be less accurate.")
+                        # Fallback: estimate fee (e.g. 5000 lamports base + priority fee if known)
+                        # tx_fee_lamports = 5000 + (cu_price_actual * (cu_limit_actual / 1_000_000)) # Rough estimate
+
+                # SOL gained = (Balance After - Balance Before) + Fee Paid for this sell tx
+                # Or simpler: SOL Gained from contract = (Balance After + Fee Paid) - Balance Before
+                # The balance change includes the fee deduction. So, (Balance After - Balance Before) is (SOL from curve - fee).
+                # Thus, SOL from curve = (Balance After - Balance Before) + fee.
+                sol_gained_from_curve = (sol_balance_after_lamports - sol_balance_before_lamports) + tx_fee_lamports
+
+                if sol_gained_from_curve < 0:  # Should not happen if sell was successful and fee is accounted for
+                    logger.warning(
+                        f"Acquired SOL calculation resulted in negative value ({sol_gained_from_curve}) for {token_info.symbol}. Using min_sol_out as fallback.")
+                    sol_gained_from_curve = min_sol_out_lamports  # Fallback to estimate
+                elif sol_gained_from_curve == 0 and min_sol_out_lamports > 0:
+                    logger.warning(
+                        f"Actual SOL acquired is 0, but min_sol_out was {min_sol_out_lamports} for {token_info.symbol}. Using min_sol_out.")
+                    sol_gained_from_curve = min_sol_out_lamports
+
+                logger.info(f"Actual SOL acquired from curve for {token_info.symbol}: {sol_gained_from_curve}")
+
+                return TradeResult(
+                    token_info=token_info, signature=tx_result.signature, success=True,
+                    initial_sol_liquidity=liquidity_at_sell_attempt_lamports,
+                    acquired_sol=sol_gained_from_curve,
+                    sold_tokens=tokens_to_sell_lamports
+                )
+            else:  # tx_result is None or not successful
+                error_msg = tx_result.error if tx_result and tx_result.error else "Send transaction failed or no signature."
+                logger.warning(f"Sell attempt {attempt + 1} for {token_info.symbol} failed: {error_msg}")
+
+            if attempt < self.max_retries - 1:
+                await asyncio.sleep(1.0 + (attempt * 0.75))
+
+        final_error = tx_result.error if tx_result and tx_result.error else "Sell failed after max retries."
+        logger.error(f"SELL_FAIL: {token_info.symbol} after {self.max_retries} attempts. Last error: {final_error}")
+        return TradeResult(
+            token_info=token_info, success=False, error=final_error,
+            initial_sol_liquidity=liquidity_at_sell_attempt_lamports
+        )
