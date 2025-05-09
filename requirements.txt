@@ -4,10 +4,13 @@ base58~=2.1.1
 PyNaCl
 borsh-construct>=0.1.0 # Or specific version if known
 python-dotenv~=1.1.0
-nest-asyncio
+nest-asyncio~=1.6.0
 solana-keypair
 solana-publickey
 # Add any other direct dependencies you know are needed
 construct~=2.10.68
 httpx~=0.28.1
 websockets~=11.0.3
+logger~=1.4
+dacite~=1.9.2
+based58~=0.1.1

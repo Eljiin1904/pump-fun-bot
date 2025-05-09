@@ -2,206 +2,232 @@
 
 import asyncio
 import json
-import websockets # Keep this import
-import base64
-# --- FIX: Add missing imports ---
-from typing import Optional, Callable, Awaitable, List, Set # Added Set
-from websockets.client import WebSocketClientProtocol # Added WebSocketClientProtocol
-# --- End Fix ---
+import time
+from typing import Optional, Callable, Awaitable, Any, Dict
+
+import websockets
+from websockets.client import WebSocketClientProtocol
+from websockets.exceptions import ConnectionClosedOK, ConnectionClosedError, ProtocolError
 
 from solders.pubkey import Pubkey
-from solana.rpc.commitment import Confirmed
 
-# Import TokenInfo from the canonical trading module
-from ..trading.base import TokenInfo
-# Import BaseTokenListener if it's truly the parent class
-from ..monitoring.base_listener import BaseTokenListener # Keep if needed
-from ..core.client import SolanaClient
-from ..core.pubkeys import PumpAddresses # Keep this import
-from .logs_event_processor import LogsEventProcessor
-from ..utils.logger import get_logger
+from src.core.client import SolanaClient as SolanaClientWrapper
+from src.core.pubkeys import PumpAddresses, SolanaProgramAddresses
+# Corrected base class import name
+from src.monitoring.base_listener import BaseTokenListener
+from src.monitoring.logs_event_processor import LogsEventProcessor
+from src.trading.base import TokenInfo
+from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-# Assuming BaseTokenListener is defined elsewhere and LogsListener inherits from it
-class LogsListener(BaseTokenListener): # Keep inheritance if correct
-    def __init__(self, wss_endpoint: str, client: SolanaClient):
-        # If BaseTokenListener has an __init__, call it
-        # super().__init__(wss_endpoint, client) # Uncomment if BaseTokenListener has __init__
+MAX_RECONNECT_ATTEMPTS = 5
+INITIAL_RECONNECT_DELAY = 5  # seconds
 
+
+class LogsListener(BaseTokenListener):
+    """Listens for pump.fun program logs via WebSocket."""
+
+    # Constructor accepts client, endpoint, processor - This is correct
+    def __init__(
+            self,
+            client: SolanaClientWrapper,
+            wss_endpoint: str,
+            processor: LogsEventProcessor
+    ):
+        self.client = client
         self.wss_endpoint = wss_endpoint
-        # --- FIX: Use correct attribute name ---
-        self.program_id = PumpAddresses.PROGRAM_ID
-        # --- End Fix ---
-        self.program_id_str = str(self.program_id) # Keep using the string version for mentions
-        self.solana_client = client # Store the client wrapper if needed by processor
-        self.processor = LogsEventProcessor(self.solana_client) # Pass client to processor
-        # Use the imported type hint
+        self.processor = processor
+        self.logger = logger
+
         self.websocket: Optional[WebSocketClientProtocol] = None
         self.subscription_id: Optional[int] = None
-        self._stop_event = asyncio.Event()
-        # Use the imported type hint
-        self.tasks: Set[asyncio.Task] = set() # Initialize task set if used for managing background tasks
-        logger.info(f"LogsListener initialized for WSS: {self.wss_endpoint}")
+        self.is_running = False
+        self._current_callback: Optional[Callable[[TokenInfo], Awaitable[None]]] = None
+        self._next_req_id = 1
+        # Add _stopped_event if needed for cleaner shutdown signalling internal loops
+        self._stopped_event = asyncio.Event()
+
+        # listen_for_tokens method seems correct (uses manual JSON subscribe)
 
     async def listen_for_tokens(
-        self,
-        token_callback: Callable[[TokenInfo], Awaitable[None]],
-        match_string: Optional[str] = None,
-        creator_address: Optional[str] = None
+            self,
+            token_callback: Callable[[TokenInfo], Awaitable[None]],
     ) -> None:
-        """
-        Connects to the WebSocket and processes logs continuously.
-        """
-        while not self._stop_event.is_set():
+        if self.is_running:
+            return
+
+        self._current_callback = token_callback
+        self.is_running = True
+        self._stopped_event.clear()  # Reset stop event on start
+        self.logger.info(f"Starting LogsListener for endpoint: {self.wss_endpoint}")
+
+        reconnect_attempts = 0
+        delay = INITIAL_RECONNECT_DELAY
+
+        # Use self.is_running for the outer reconnect loop condition
+        while self.is_running and reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
             try:
-                logger.info(f"Attempting WebSocket connection to {self.wss_endpoint}...")
-                # Use standard websockets.connect context manager
-                async with websockets.connect(self.wss_endpoint, ping_interval=20, ping_timeout=60) as ws:
-                    self.websocket = ws # Assign the connection object
-                    logger.info("WebSocket connected. Subscribing...")
-                    # Send subscription request
-                    await ws.send(json.dumps({
+                async with websockets.connect(
+                        self.wss_endpoint, ping_interval=20, ping_timeout=20
+                ) as ws:
+                    self.websocket = ws
+                    reconnect_attempts = 0  # Reset on success
+                    delay = INITIAL_RECONNECT_DELAY  # Reset delay
+                    self.logger.info("WebSocket connected. Subscribing to logs...")
+
+                    req_id = self._next_req_id
+                    self._next_req_id += 1
+
+                    subscribe_payload = {
                         "jsonrpc": "2.0",
-                        "id": 1, # Use an ID for matching responses if needed
+                        "id": req_id,
                         "method": "logsSubscribe",
-                        # Subscribe to logs mentioning the pump.fun program ID
-                        "params": [{"mentions": [self.program_id_str]}, {"commitment": "processed"}]
-                    }))
+                        "params": [
+                            {"mentions": [str(PumpAddresses.PROGRAM_ID)]},
+                            {"commitment": "confirmed"}  # Use string directly
+                        ]
+                    }
+                    await ws.send(json.dumps(subscribe_payload))
+                    self.logger.debug(f"Sent logsSubscribe (ID {req_id})")
 
-                    # Wait for the subscription confirmation response
-                    first_resp = await asyncio.wait_for(ws.recv(), timeout=30.0)
-                    resp_data = json.loads(first_resp)
+                    # Process messages until connection closes or stopped
+                    await self._process_messages(ws, req_id)
 
-                    # Check if subscription was successful
-                    if resp_data.get("result") and isinstance(resp_data["result"], int):
-                        self.subscription_id = resp_data["result"]
-                        logger.info(f"Subscribed with ID: {self.subscription_id}")
-                    elif resp_data.get("error"):
-                        logger.error(f"Subscription failed: {resp_data['error']}")
-                        await asyncio.sleep(5) # Wait before retrying connection
-                        continue # Go back to the start of the while loop
-                    else:
-                        logger.error(f"Unexpected subscription response format: {first_resp}")
-                        await asyncio.sleep(5)
-                        continue
-
-                    # Process messages received after successful subscription
-                    async for message in ws:
-                        if self._stop_event.is_set():
-                            logger.debug("Stop event set, breaking message loop.")
-                            break
-                        # Process each message in a separate task to avoid blocking
-                        # Create a task and add it to the set for potential management
-                        task = asyncio.create_task(
-                             self._process_log_notification(message, token_callback, match_string, creator_address)
-                        )
-                        self.tasks.add(task)
-                        # Optional: Remove completed tasks to prevent memory leak
-                        task.add_done_callback(self.tasks.discard)
-
-            except websockets.exceptions.ConnectionClosedOK:
-                logger.info("WebSocket connection closed normally.")
-            except websockets.exceptions.ConnectionClosedError as e:
-                logger.warning(f"WebSocket connection closed with error: {e}. Reconnecting...")
-            except asyncio.TimeoutError:
-                logger.warning("WebSocket connection or subscription timed out. Reconnecting...")
-            except ConnectionRefusedError:
-                 logger.error("WebSocket connection refused. Check endpoint/network. Retrying...")
+            except (
+            ConnectionClosedOK, ConnectionClosedError, ProtocolError, websockets.exceptions.InvalidStatusCode) as e:
+                # Handle disconnects and specific errors like bad status code
+                reconnect_attempts += 1
+                log_level = logger.error if isinstance(e, websockets.exceptions.InvalidStatusCode) else logger.warning
+                log_level(
+                    f"WebSocket disconnected ({reconnect_attempts}/{MAX_RECONNECT_ATTEMPTS}): {e}"
+                )
+                if isinstance(e, websockets.exceptions.InvalidStatusCode):
+                    logger.error("Stopping attempts due to invalid status code (check endpoint/key).")
+                    self.is_running = False  # Stop trying if auth/endpoint is bad
+                elif self.is_running and reconnect_attempts < MAX_RECONNECT_ATTEMPTS:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 60)  # Exponential backoff capped at 60s
+                elif self.is_running:  # Max attempts reached
+                    logger.error("Max reconnect attempts reached. Stopping listener.")
+                    self.is_running = False
             except Exception as e:
-                # Catch other potential errors (JSON decoding, etc.)
-                logger.error(f"Unexpected error in WebSocket listen loop: {type(e).__name__}: {e}. Reconnecting...", exc_info=False) # Less verbose logging for loop errors
-
+                self.logger.error(f"Unexpected error in listen_for_tokens: {e}", exc_info=True)
+                self.is_running = False  # Stop on unexpected errors
+                break  # Exit loop
             finally:
-                # Cleanup before retry/exit
+                # Cleanup for this attempt
                 self.websocket = None
                 self.subscription_id = None
-                if not self._stop_event.is_set():
-                    logger.info("Waiting 5 seconds before attempting reconnection...")
-                    await asyncio.sleep(5) # Wait before retrying connection
 
-        logger.info("listen_for_tokens loop finished.")
+        self.logger.info("LogsListener listen_for_tokens loop finished.")
+        self._stopped_event.set()  # Signal completion
 
+    async def _process_messages(
+            self,
+            websocket: WebSocketClientProtocol,
+            subscribe_req_id: int
+    ) -> None:
+        """Processes messages received on the WebSocket."""
+        self.subscription_id = None  # Reset sub ID for this connection
+        while self.is_running:  # Check is_running flag
+            try:
+                raw_msg = await asyncio.wait_for(websocket.recv(), timeout=60.0)
+                msg = json.loads(raw_msg)
 
-    async def _process_log_notification(
-        self,
-        message: str,
-        token_callback: Callable[[TokenInfo], Awaitable[None]],
-        match_string: Optional[str],
-        creator_address: Optional[str]
-    ):
-        """
-        Processes a single log notification message.
-        """
-        try:
-            data = json.loads(message)
-            # Ensure it's a log notification
-            if data.get("method") != "logsNotification":
-                return
+                # Handle subscription confirmation
+                if msg.get("id") == subscribe_req_id and "result" in msg:
+                    if isinstance(msg["result"], int):
+                        self.subscription_id = msg["result"]
+                        self.logger.info(f"Subscription confirmed with ID: {self.subscription_id}")
+                    else:
+                        self.logger.warning(
+                            f"Subscription confirmation received, but result is not an integer ID: {msg['result']}")
+                    continue  # Move to next message once confirmation is handled
 
-            # Extract relevant details safely using .get()
-            params = data.get("params", {})
-            result = params.get("result", {})
-            value = result.get("value", {})
-            logs: List[str] = value.get("logs", [])
-            signature = value.get("signature")
-            err = value.get("err")
+                # Handle notifications
+                params = msg.get("params")
+                if msg.get("method") == "logsNotification" and params:
+                    subscription_id_in_params = params.get("subscription")
+                    # Process only if it matches our current subscription ID
+                    if self.subscription_id is not None and subscription_id_in_params == self.subscription_id:
+                        notification_result = params.get("result")
+                        # Ensure the result structure is valid before passing
+                        if isinstance(notification_result,
+                                      dict) and "value" in notification_result and self._current_callback:
+                            # --- CORRECTED PROCESSOR CALL ---
+                            # Call the method that expects the result dictionary
+                            await self.processor.process_log_notification_result(
+                                notification_result, self._current_callback
+                            )
+                            # --- END CORRECTION ---
+                        # Optional: Log if result format is bad
+                        # elif notification_result: logger.warning("...")
+                    # Optional: Log if message is for a different/old subscription
+                    # elif self.subscription_id is not None: logger.warning("...")
+                    continue  # Move to next message
 
-            if err is not None:
-                logger.debug(f"Skipping failed transaction: {signature}")
-                return
-            if not signature:
-                logger.warning(f"Log notification missing signature: {value}")
-                return
+                # Optional: Handle other message types if needed
+                # logger.debug(f"Received unhandled WS message type: {msg}")
 
-            # Check for the specific "Instruction: Create" log entry more robustly
-            is_create_ix_log = False
-            for log in logs:
-                # Simple check, might need adjustment if format changes
-                if "Program log: Instruction: Create" in log:
-                    is_create_ix_log = True
-                    break # Found it, no need to check further
-
-            if is_create_ix_log:
-                logger.info(f"Potential Create transaction detected: {signature}")
-                # Call the processor to parse event data from logs
-                token_info: Optional[TokenInfo] = await self.processor.process_create_event(logs, signature)
-
-                if token_info:
-                    # --- Apply Filters ---
-                    name_symbol = (token_info.name + token_info.symbol).lower()
-                    # Match string filter (case-insensitive)
-                    if match_string and match_string.lower() not in name_symbol:
-                        logger.debug(f"Token {token_info.symbol} filtered out by match string '{match_string}'.")
-                        return
-                    # Creator address filter (case-insensitive)
-                    if creator_address and str(token_info.user).lower() != creator_address.lower():
-                        logger.debug(f"Token {token_info.symbol} filtered out by creator address '{creator_address}'.")
-                        return
-                    # --- End Filters ---
-
-                    logger.info(f"Invoking callback for token {token_info.symbol} ({token_info.mint})")
-                    try:
-                        await token_callback(token_info)
-                    except Exception as cb_e:
-                        logger.error(f"Error invoking token callback for {token_info.symbol}: {cb_e}", exc_info=True)
-        except json.JSONDecodeError:
-            logger.warning(f"Failed to decode JSON from WebSocket message: {message[:150]}...") # Show more context
-        except Exception as e:
-            logger.error(f"Error processing WebSocket message: {e}", exc_info=True)
-
+            except asyncio.TimeoutError:
+                # Send ping on timeout
+                try:
+                    pong_waiter = await websocket.ping()
+                    await asyncio.wait_for(pong_waiter, timeout=10)
+                except asyncio.TimeoutError:
+                    self.logger.warning("WebSocket pong timeout. Breaking process loop.")
+                    break  # Assume connection is dead, exit to reconnect
+                except Exception as e_ping:
+                    self.logger.warning(f"WebSocket ping failed: {e_ping}. Breaking process loop.")
+                    break  # Assume connection is dead, exit to reconnect
+            except (ConnectionClosedOK, ConnectionClosedError, ProtocolError):
+                self.logger.warning("WebSocket closed during message processing.")
+                break  # Exit loop normally on close
+            except json.JSONDecodeError:
+                self.logger.warning(f"Received non-JSON WS message: {raw_msg[:100]}")
+                continue  # Skip malformed message
+            except Exception as e:
+                self.logger.error(f"Error processing message: {e}", exc_info=True)
+                # Consider if we should break or continue on processing errors
+                await asyncio.sleep(1)  # Small delay before continuing
 
     async def stop(self) -> None:
-        """
-        Signals the listener to stop and closes the WebSocket connection.
-        """
-        if not self._stop_event.is_set():
-            logger.info("Stopping LogsListener...")
-            self._stop_event.set()
-            if self.websocket:
-                logger.info("Closing WebSocket connection...")
-                await self.websocket.close()
-                self.websocket = None # Clear reference after closing
-            logger.info("LogsListener stop signaled.")
-        else:
-            logger.info("LogsListener already stopping/stopped.")
+        """Signals the listener to stop and attempts to clean up resources."""
+        if not self.is_running and not self.websocket:
+            return
+
+        self.logger.info("Stopping LogsListener...")
+        self.is_running = False  # Signal loops to stop
+        self._stopped_event.set()  # Signal completion event if anything is waiting on it
+
+        ws = self.websocket  # Local ref
+        sub_id = self.subscription_id  # Local ref
+        self.websocket = None  # Clear instance vars immediately
+        self.subscription_id = None
+
+        if ws and sub_id is not None:
+            try:
+                # Send unsubscribe using manual JSON
+                req_id = self._next_req_id
+                self._next_req_id += 1
+                unsubscribe = {
+                    "jsonrpc": "2.0",
+                    "id": req_id,
+                    "method": "logsUnsubscribe",
+                    "params": [sub_id],
+                }
+                await ws.send(json.dumps(unsubscribe))
+                self.logger.info(f"Sent unsubscribe for subscription ID: {sub_id}")
+            except Exception as e:
+                self.logger.warning(f"Error sending unsubscribe (connection might be closed): {e}")
+
+        if ws:  # Close websocket if reference exists
+            try:
+                await ws.close(code=1000, reason="Client stopping")
+                self.logger.info("WebSocket connection closed by stop().")
+            except Exception as e:
+                self.logger.warning(f"Error closing WebSocket during stop(): {e}")
+
+        self._current_callback = None
+        self.logger.info("LogsListener shutdown attempt complete.")
