@@ -1,4 +1,5 @@
-# src/monitoring/listener_factory.py (Corrected Version from Response #35)
+# src/monitoring/listener_factory.py
+
 from typing import Optional
 
 # Core imports
@@ -9,8 +10,6 @@ from src.utils.logger import get_logger
 from .base_listener import BaseTokenListener
 from .logs_listener import LogsListener
 from .logs_event_processor import LogsEventProcessor
-
-# Import other potential listener types if they exist
 
 logger = get_logger(__name__)
 
@@ -23,29 +22,34 @@ class ListenerFactory:
 
     @staticmethod
     def create_listener(
-            listener_type: str,
-            client: SolanaClient,  # The main SolanaClient wrapper instance is now required
-            wss_endpoint: str,
+        listener_type: str,
+        client: SolanaClient,           # required for RPC calls
+        wss_endpoint: str,              # WebSocket URL
+        create_event_discriminator: str # 8-byte hex prefix for your on-chain event
     ) -> BaseTokenListener:
         """
         Creates and returns an instance of a specific listener based on type.
-        # ... (rest of docstring) ...
         """
         logger.info(f"Creating listener of type: '{listener_type}'")
 
         if listener_type == "logs":
             if not client:
                 raise ValueError(
-                    "SolanaClient instance is required to initialize LogsEventProcessor for the 'logs' listener.")
+                    "SolanaClient instance is required to initialize LogsEventProcessor for the 'logs' listener."
+                )
 
-            processor = LogsEventProcessor(client=client)
+            # Pass ONLY the discriminator into the processor
+            processor = LogsEventProcessor(create_event_discriminator)
 
-            # --- THIS IS THE CRITICAL LINE ---
-            # It correctly passes 'client=client' to the LogsListener constructor
             logger.debug(
-                f"FACTORY DEBUG: Preparing to call LogsListener with wss={wss_endpoint}, proc={type(processor).__name__}, client={type(client).__name__}")  # Added debug from suggestion
-            return LogsListener(wss_endpoint=wss_endpoint, processor=processor, client=client)
-            # --- END CRITICAL LINE ---
+                f"FACTORY DEBUG: Preparing to call LogsListener "
+                f"with wss={wss_endpoint}, proc={type(processor).__name__}, client={type(client).__name__}"
+            )
+            return LogsListener(
+                wss_endpoint=wss_endpoint,
+                processor=processor,
+                client=client
+            )
 
         elif listener_type == "birdeye":
             logger.error("Birdeye listener is not implemented in this factory.")
