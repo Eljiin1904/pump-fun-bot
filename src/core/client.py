@@ -2,42 +2,60 @@
 
 import asyncio
 import logging
-from typing import Any, List, Optional, Tuple, Union
+import base64
+from typing import Any, List, Optional, Tuple, Union, Dict
 
 from solders.pubkey import Pubkey
 from solders.keypair import Keypair
 from solders.hash import Hash
 from solders.signature import Signature
-from solders.solders import Instruction
 from solders.transaction import VersionedTransaction
 from solders.message import MessageV0
+from solders.instruction import Instruction as SoldersInstruction
 
 from solders.rpc.config import (
     RpcAccountInfoConfig,
     RpcProgramAccountsConfig,
     RpcSendTransactionConfig,
 )
-from solders.account_decoder import UiAccountEncoding
+from solders.account_decoder import UiAccountEncoding, UiTokenAmount
 from solders.rpc.filter import Memcmp
-from solders.rpc.responses import GetTransactionResp, SimulateTransactionResp, SendTransactionResp
+from solders.rpc.responses import (
+    GetLatestBlockhashResp,
+    GetAccountInfoResp,
+    GetProgramAccountsResp,
+    GetBalanceResp,
+    GetTokenAccountBalanceResp,
+    GetTokenSupplyResp,
+    GetTokenLargestAccountsResp,
+    GetTransactionResp,
+    SendTransactionResp,
+    SimulateTransactionResp,
+)
 from solders.transaction_status import UiTransactionEncoding, EncodedTransactionWithStatusMeta
 from solders.compute_budget import set_compute_unit_limit, set_compute_unit_price
 
 from solana.rpc.async_api import AsyncClient
 from solana.rpc.commitment import Commitment, Confirmed
 from solana.rpc.core import RPCException
-from solana.rpc.types import TxOpts
-from solana.transaction import Transaction as LegacyTransaction
+from solana.rpc.types import TxOpts as SolanaPyTxOpts
+from solana.transaction import Transaction as SolanaPyLegacyTransaction
 
 from spl.token.instructions import get_associated_token_address
 
 logger = logging.getLogger(__name__)
 
-# Constants
 MEMO_PROGRAM_ID = Pubkey.from_string("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr")
 DEFAULT_TIMEOUT_SECONDS = 60
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_RETRY_DELAY_SECONDS = 2
+
+
+class TokenSupplyInfo:
+    def __init__(self, amount: int, decimals: int, ui_amount_string: Optional[str]):
+        self.amount = amount
+        self.decimals = decimals
+        self.ui_amount_string = ui_amount_string
 
 
 class SolanaClient:
@@ -51,10 +69,9 @@ class SolanaClient:
         retry_delay_seconds: int = DEFAULT_RETRY_DELAY_SECONDS,
         skip_preflight: bool = False,
     ) -> None:
+        self.rpc_endpoint = rpc_endpoint
         self.async_client = AsyncClient(
-            rpc_endpoint,
-            commitment=commitment,
-            timeout=timeout_seconds,
+            rpc_endpoint, commitment=commitment, timeout=timeout_seconds
         )
         self.keypair = keypair
         self.commitment = commitment
@@ -62,7 +79,16 @@ class SolanaClient:
         self.max_retries = max_retries
         self.retry_delay = retry_delay_seconds
         self.skip_preflight = skip_preflight
-        logger.info(f"SolanaClient initialized with RPC: {rpc_endpoint}")
+        self.tx_opts = SolanaPyTxOpts(
+            skip_preflight=self.skip_preflight, preflight_commitment=self.commitment
+        )
+
+        commit_val = (
+            self.commitment.value
+            if hasattr(self.commitment, "value")
+            else str(self.commitment)
+        )
+        logger.info(f"SolanaClient initialized: {rpc_endpoint} @ {commit_val}")
 
     async def __aenter__(self) -> "SolanaClient":
         return self
@@ -71,7 +97,6 @@ class SolanaClient:
         await self.close()
 
     async def close(self) -> None:
-        """Gracefully close the underlying HTTP session."""
         try:
             await self.async_client.close()
             logger.info("SolanaClient connection closed.")
@@ -80,7 +105,9 @@ class SolanaClient:
 
     async def get_latest_blockhash(self) -> Optional[Hash]:
         try:
-            resp = await self.async_client.get_latest_blockhash(self.commitment)
+            resp: GetLatestBlockhashResp = await self.async_client.get_latest_blockhash(
+                self.commitment
+            )
             return resp.value.blockhash if resp.value else None
         except Exception as e:
             logger.error(f"Error get_latest_blockhash: {e}", exc_info=True)
@@ -92,11 +119,7 @@ class SolanaClient:
         commitment: Optional[Commitment] = None,
         encoding_str: str = "base64",
         data_slice: Any = None,
-    ) -> Any:
-        """
-        Returns whatever AsyncClient.get_account_info returns.
-        We'll treat it as 'Any' since RpcResponse isn't a public import.
-        """
+    ) -> Optional[GetAccountInfoResp]:
         enc_map = {
             "base64": UiAccountEncoding.Base64,
             "base64+zstd": UiAccountEncoding.Base64Zstd,
@@ -110,50 +133,52 @@ class SolanaClient:
             min_context_slot=None,
         )
         try:
-            return await self.async_client.get_account_info(pubkey, config)
+            resp: GetAccountInfoResp = await self.async_client.get_account_info(
+                pubkey, config
+            )
+            if resp.error:
+                logger.error(
+                    f"RPC error get_account_info {pubkey}: {resp.error}"
+                )
+                return None
+            return resp
         except Exception as e:
-            logger.error(f"Error get_account_info for {pubkey}: {e}", exc_info=True)
+            logger.error(f"Error get_account_info {pubkey}: {e}", exc_info=True)
             return None
-
-    async def get_mint_info(self, mint_pubkey: Pubkey) -> Optional[int]:
-        info = await self.get_account_info(mint_pubkey, encoding_str="jsonparsed")
-        if info and info.value and info.value.data:
-            parsed = info.value.data.parsed
-            return int(parsed["info"].get("decimals", 0))
-        return None
 
     async def get_program_accounts(
         self,
         program_id: Pubkey,
         commitment: Optional[Commitment] = None,
         encoding_str: str = "base64",
-        filters: Optional[List[dict]] = None,
+        filters: Optional[List[Dict[str, Any]]] = None,
         data_slice: Any = None,
-    ) -> Any:
+    ) -> Optional[GetProgramAccountsResp]:
         enc_map = {
             "base64": UiAccountEncoding.Base64,
             "base64+zstd": UiAccountEncoding.Base64Zstd,
             "jsonparsed": UiAccountEncoding.JsonParsed,
         }
         enum_enc = enc_map.get(encoding_str.lower(), UiAccountEncoding.Base64)
-        acct_cfg = RpcAccountInfoConfig(
-            encoding=enum_enc,
-            data_slice=data_slice,
-            min_context_slot=None,
-        )
-
-        solders_filters = []
+        acct_cfg = RpcAccountInfoConfig(encoding=enum_enc, data_slice=data_slice)
+        solders_filters: List[Union[int, Memcmp]] = []
         if filters:
             for f in filters:
                 if "memcmp" in f and isinstance(f["memcmp"], dict):
+                    args = f["memcmp"]
+                    b = args["bytes"]
+                    if isinstance(b, str):
+                        try:
+                            b = Pubkey.from_string(b).to_bytes()
+                        except ValueError:
+                            b = b.encode()
                     solders_filters.append(
-                        Memcmp(offset=f["memcmp"]["offset"], bytes=f["memcmp"]["bytes"])
+                        Memcmp(offset=args["offset"], bytes=b)
                     )
-                # Note: DataSize is not available in solders.rpc.filter
-
+                elif "dataSize" in f:
+                    solders_filters.append(int(f["dataSize"]))
         config = RpcProgramAccountsConfig(
-            filters=solders_filters or None,
-            account_config=acct_cfg,
+            filters=solders_filters or None, account_config=acct_cfg
         )
         try:
             return await self.async_client.get_program_accounts(
@@ -162,210 +187,178 @@ class SolanaClient:
                 commitment=commitment or self.commitment,
             )
         except Exception as e:
-            logger.error(f"Error get_program_accounts for {program_id}: {e}", exc_info=True)
+            logger.error(f"Error get_program_accounts {program_id}: {e}", exc_info=True)
             return None
 
     async def get_balance_lamports(self, pubkey: Pubkey) -> Optional[int]:
         try:
-            resp = await self.async_client.get_balance(pubkey, self.commitment)
+            resp: GetBalanceResp = await self.async_client.get_balance(
+                pubkey, self.commitment
+            )
             return resp.value
         except Exception as e:
-            logger.error(f"Error get_balance_lamports for {pubkey}: {e}", exc_info=True)
+            logger.error(f"Error get_balance {pubkey}: {e}", exc_info=True)
             return None
 
-    async def get_token_account_balance_lamports(self, token_account: Pubkey) -> int:
+    async def get_token_account_balance_atoms(
+        self, token_account_pk: Pubkey
+    ) -> Optional[int]:
         try:
-            resp = await self.async_client.get_token_account_balance(
-                token_account, self.commitment
+            resp: GetTokenAccountBalanceResp = (
+                await self.async_client.get_token_account_balance(
+                    token_account_pk, self.commitment
+                )
             )
-            return int(resp.value.amount) if resp.value else 0
+            if resp.value:
+                return int(resp.value.amount)
+            if resp.error:
+                logger.error(f"RPC error get_token_account_balance {token_account_pk}: {resp.error}")
+            return None
         except RPCException:
+            logger.warning(f"Account not found {token_account_pk}")
             return 0
         except Exception as e:
-            logger.error(f"Error get_token_account_balance: {e}", exc_info=True)
-            return 0
+            logger.error(f"Error get_token_account_balance {token_account_pk}: {e}", exc_info=True)
+            return None
 
     async def get_token_balance_lamports(
-        self, owner_pubkey: Pubkey, mint_pubkey: Pubkey
+        self, owner: Pubkey, mint: Pubkey
     ) -> Optional[int]:
-        ata = get_associated_token_address(owner_pubkey, mint_pubkey)
-        return await self.get_token_account_balance_lamports(ata)
+        ata = get_associated_token_address(owner, mint)
+        return await self.get_token_account_balance_atoms(ata)
 
-    async def get_token_supply(self, mint_pubkey: Pubkey) -> Optional[int]:
+    async def get_mint_decimals(self, mint_pubkey: Pubkey) -> Optional[int]:
+        resp = await self.get_account_info(mint_pubkey, encoding_str="jsonparsed")
+        if resp and resp.value and isinstance(resp.value.data, dict):
+            parsed = resp.value.data.get("parsed", {})
+            info = parsed.get("info", {})
+            dec = info.get("decimals")
+            if isinstance(dec, int):
+                return dec
+        return None
+
+    async def get_token_supply(
+        self, mint_pubkey: Pubkey
+    ) -> Optional[TokenSupplyInfo]:
         try:
-            resp = await self.async_client.get_token_supply(mint_pubkey, self.commitment)
-            return int(resp.value.amount) if resp.value else None
+            resp: GetTokenSupplyResp = await self.async_client.get_token_supply(
+                mint_pubkey, self.commitment
+            )
+            if resp.value:
+                ua = resp.value
+                return TokenSupplyInfo(
+                    amount=int(ua.amount),
+                    decimals=ua.decimals,
+                    ui_amount_string=ua.ui_amount_string,
+                )
+            if resp.error:
+                logger.error(f"RPC error get_token_supply {mint_pubkey}: {resp.error}")
+            return None
         except Exception as e:
-            logger.error(f"Error get_token_supply for {mint_pubkey}: {e}", exc_info=True)
+            logger.error(f"Error get_token_supply {mint_pubkey}: {e}", exc_info=True)
             return None
 
-    async def get_transaction(
+    async def get_token_largest_accounts(
+        self, mint_pubkey: Pubkey
+    ) -> Optional[List[UiTokenAmount]]:
+        try:
+            resp: GetTokenLargestAccountsResp = (
+                await self.async_client.get_token_largest_accounts(
+                    mint_pubkey, self.commitment
+                )
+            )
+            if resp.value:
+                return resp.value  # List[UiTokenAmount]
+            if resp.error:
+                logger.error(f"RPC error get_token_largest_accounts {mint_pubkey}: {resp.error}")
+            return None
+        except Exception as e:
+            logger.error(f"Error get_token_largest_accounts {mint_pubkey}: {e}", exc_info=True)
+            return None
+
+    async def get_transaction_details(
         self,
         tx_sig_str: str,
         encoding: UiTransactionEncoding = UiTransactionEncoding.JsonParsed,
-        max_supported_transaction_version: Optional[int] = None,
+        max_supported_transaction_version: Optional[int] = 0,
     ) -> Optional[EncodedTransactionWithStatusMeta]:
         try:
             sig = Signature.from_string(tx_sig_str)
-            params = {"encoding": encoding, "commitment": self.commitment}
-            if max_supported_transaction_version is not None:
-                params["max_supported_transaction_version"] = max_supported_transaction_version
-            resp: GetTransactionResp = await self.async_client.get_transaction(sig, **params)  # type: ignore
+            resp: GetTransactionResp = await self.async_client.get_transaction(
+                sig,
+                encoding=encoding,
+                commitment=self.commitment,
+                max_supported_transaction_version=max_supported_transaction_version,
+            )
             return resp.value
         except Exception as e:
-            logger.error(f"Error get_transaction for {tx_sig_str}: {e}", exc_info=True)
+            logger.error(f"Error get_transaction_details {tx_sig_str}: {e}", exc_info=True)
             return None
 
     async def send_transaction(
         self,
-        transaction: Union[LegacyTransaction, VersionedTransaction],
+        transaction: Union[SolanaPyLegacyTransaction, VersionedTransaction],
         signers: Optional[List[Keypair]] = None,
-        opts: Optional[TxOpts] = None,
+        opts: Optional[SolanaPyTxOpts] = None,
         max_retries: Optional[int] = None,
         retry_delay_seconds: Optional[int] = None,
     ) -> Optional[Signature]:
         _signers = signers or ([self.keypair] if self.keypair else [])
-        if not _signers:
-            raise ValueError("Transaction needs signers.")
-        _opts = opts or TxOpts(skip_preflight=self.skip_preflight, preflight_commitment=self.commitment)
-        retries = max_retries if max_retries is not None else self.max_retries
-        delay = retry_delay_seconds if retry_delay_seconds is not None else self.retry_delay
+        _opts = opts or self.tx_opts
+        _retries = max_retries if max_retries is not None else self.max_retries
+        _delay = retry_delay_seconds if retry_delay_seconds is not None else self.retry_delay
 
-        for attempt in range(retries + 1):
+        for attempt in range(_retries + 1):
             try:
-                if isinstance(transaction, LegacyTransaction) and not transaction.recent_blockhash:
-                    bh = await self.get_latest_blockhash()
-                    if not bh:
-                        raise RPCException("Failed to get blockhash.")
-                    transaction.recent_blockhash = bh
-
-                signer_args = (
-                    transaction.signers
-                    if isinstance(transaction, VersionedTransaction)
-                    else _signers
-                )
-                resp: SendTransactionResp = await self.async_client.send_transaction(
-                    transaction, *signer_args, opts=_opts  # type: ignore
-                )
-                logger.info(f"Transaction sent: {resp.value} (attempt {attempt + 1})")
+                if isinstance(transaction, SolanaPyLegacyTransaction):
+                    if not transaction.recent_blockhash:
+                        bh = await self.get_latest_blockhash()
+                        if not bh:
+                            raise RPCException("Failed to get blockhash")
+                        transaction.recent_blockhash = bh
+                    resp: SendTransactionResp = await self.async_client.send_transaction(
+                        transaction, *_signers, opts=_opts
+                    )
+                else:
+                    resp: SendTransactionResp = await self.async_client.send_transaction(
+                        transaction, opts=_opts
+                    )
+                logger.info(f"Tx sent: {resp.value} (attempt {attempt+1})")
                 return resp.value
-
+            except RPCException as err:
+                logger.warning(f"RPC send_transaction error (attempt {attempt+1}): {err}")
             except Exception as err:
-                logger.warning(f"Send tx error (attempt {attempt + 1}): {err}")
-                if "blockhash" in str(err).lower() and isinstance(transaction, LegacyTransaction):
-                    transaction.recent_blockhash = None
-            if attempt < retries:
-                await asyncio.sleep(delay)
+                logger.warning(f"send_transaction error (attempt {attempt+1}): {err}", exc_info=True)
 
-        logger.error(f"Failed to send transaction after {retries + 1} attempts.")
+            if attempt < _retries:
+                await asyncio.sleep(_delay)
+        logger.error("send_transaction failed after retries")
         return None
-
-    async def send_legacy_transaction(
-        self,
-        instructions: List[Any],
-        signers: Optional[List[Keypair]] = None,
-        recent_blockhash_str: Optional[str] = None,
-        add_memo: Optional[str] = None,
-        **kwargs,
-    ) -> Optional[Signature]:
-        _signers = signers or ([self.keypair] if self.keypair else [])
-        if not _signers:
-            raise ValueError("Legacy transaction needs signers.")
-        payer = _signers[0].pubkey()
-        bh = (
-            Hash.from_string(recent_blockhash_str)
-            if recent_blockhash_str
-            else await self.get_latest_blockhash()
-        )
-        if not bh:
-            raise RPCException("Failed to get blockhash.")
-        tx = LegacyTransaction(recent_blockhash=bh, fee_payer=payer)
-        for instr in instructions:
-            tx.add(instr)
-        if add_memo:
-            tx.add(Instruction(MEMO_PROGRAM_ID, add_memo.encode(), []))
-        return await self.send_transaction(tx, _signers, **kwargs)
-
-    async def send_versioned_transaction(
-        self,
-        instructions: List[Any],
-        payer: Keypair,
-        add_memo: Optional[str] = None,
-        **kwargs,
-    ) -> Optional[Signature]:
-        tx_ins = list(instructions)
-        if add_memo:
-            tx_ins.append(Instruction(MEMO_PROGRAM_ID, add_memo.encode(), []))
-
-        bh = await self.get_latest_blockhash()
-        if not bh:
-            raise RPCException("Failed to get blockhash.")
-
-        msg = MessageV0.compile(
-            instructions=tx_ins,
-            payer=payer.pubkey(),
-            recent_blockhash=bh,
-            address_table_lookups=None,
-        )
-        vtx = VersionedTransaction(msg, [payer])
-        return await self.send_transaction(vtx, [payer], **kwargs)
-
-    async def simulate_transaction(
-        self,
-        transaction: Union[LegacyTransaction, VersionedTransaction],
-        signers: Optional[List[Keypair]] = None,
-        commitment: Optional[Commitment] = None,
-        replace_recent_blockhash: bool = True,
-        sim_config: Optional[RpcSendTransactionConfig] = None,
-    ) -> Optional[SimulateTransactionResp]:
-        _cfg = sim_config or RpcSendTransactionConfig(
-            skip_preflight=False,
-            preflight_commitment=commitment or self.commitment,
-            encoding=UiTransactionEncoding.Base64,
-            sig_verify=False,
-        )
-        if isinstance(transaction, LegacyTransaction):
-            _signers = signers or ([self.keypair] if self.keypair else [])
-            if not _signers:
-                raise ValueError("Legacy tx simulation needs signers.")
-            if replace_recent_blockhash or not transaction.recent_blockhash:
-                bh = await self.get_latest_blockhash()
-                if not bh:
-                    raise RPCException("Failed to get blockhash.")
-                transaction.recent_blockhash = bh
-            return await self.async_client.simulate_transaction(transaction, *_signers, config=_cfg)  # type: ignore
-        return await self.async_client.simulate_transaction(transaction, config=_cfg)  # type: ignore
 
     async def confirm_transaction(
         self,
         tx_sig: Signature,
-        commitment: Optional[Commitment] = None,
-        sleep_seconds: float = 2.0,
-        timeout_seconds: Optional[int] = None,
+        commitment_override: Optional[Commitment] = None,
+        sleep_seconds: float = DEFAULT_RETRY_DELAY_SECONDS,
+        timeout_s_override: Optional[int] = None,
     ) -> Optional[EncodedTransactionWithStatusMeta]:
-        _commit = commitment or self.commitment
-        _timeout = timeout_seconds or self.timeout_seconds
-        elapsed = 0.0
-        while elapsed < _timeout:
-            try:
-                status_resp = await self.async_client.get_signature_statuses([tx_sig])
-                if status_resp.value and status_resp.value[0]:
-                    st = status_resp.value[0]
-                    if st.err:
-                        logger.error(f"Tx {tx_sig} failed: {st.err}")
-                        return None
-                    if st.confirmation_status in ("confirmed", "finalized"):
-                        return await self.get_transaction(str(tx_sig))
-            except Exception:
-                pass
-            await asyncio.sleep(sleep_seconds)
-            elapsed += sleep_seconds
-        logger.warning(f"Timeout confirming {tx_sig} after {_timeout}s")
+        _commit = commitment_override or self.commitment
+        _timeout = timeout_s_override or self.timeout_seconds
+        logger.info(f"Confirming {tx_sig} @ {_commit.value} timeout={_timeout}")
+        try:
+            result = await asyncio.wait_for(
+                self.async_client.confirm_transaction(tx_sig, _commit, sleep_secs=sleep_seconds),
+                timeout=_timeout,
+            )
+            if result.value and result.value[0] and not result.value[0].err:
+                return await self.get_transaction_details(str(tx_sig))
+        except Exception as e:
+            logger.error(f"confirm_transaction error for {tx_sig}: {e}", exc_info=True)
         return None
 
     async def build_and_send_transaction(
         self,
-        instructions: List[Any],
+        instructions: List[SoldersInstruction],
         signers: Optional[List[Keypair]] = None,
         add_memo: Optional[str] = None,
         use_versioned_tx: bool = False,
@@ -373,19 +366,51 @@ class SolanaClient:
     ) -> Tuple[Optional[str], Optional[EncodedTransactionWithStatusMeta]]:
         _signers = signers or ([self.keypair] if self.keypair else [])
         if not _signers:
-            raise ValueError("Transaction needs signers.")
+            raise ValueError("Transaction needs signers")
         payer = _signers[0]
-        sig = None
+
+        tx_instructions = []
+        fee_limit = kwargs.get("cu_limit")
+        fee_price = kwargs.get("priority_fee_microlamports")
+        if fee_price:
+            tx_instructions.append(set_compute_unit_price(fee_price))
+        if fee_limit:
+            tx_instructions.append(set_compute_unit_limit(fee_limit))
+        tx_instructions.extend(instructions)
+        if add_memo:
+            tx_instructions.append(
+                SoldersInstruction(
+                    MEMO_PROGRAM_ID, add_memo.encode(), []
+                )
+            )
+
+        bh = await self.get_latest_blockhash()
+        if not bh:
+            return None, None
 
         if use_versioned_tx:
-            sig = await self.send_versioned_transaction(instructions, payer, add_memo=add_memo, **kwargs)
+            msg = MessageV0.compile(
+                instructions=tx_instructions,
+                payer=payer.pubkey(),
+                recent_blockhash=bh,
+                address_table_lookups=None,
+            )
+            tx = VersionedTransaction(msg, _signers)
+            sig = await self.send_transaction(tx, opts=kwargs.get("opts"))
         else:
-            sig = await self.send_legacy_transaction(instructions, _signers, add_memo=add_memo, **kwargs)
+            legacy = SolanaPyLegacyTransaction(
+                recent_blockhash=bh, fee_payer=payer.pubkey()
+            )
+            for ix in tx_instructions:
+                legacy.add(ix)
+            sig = await self.send_transaction(legacy, _signers, opts=kwargs.get("opts"))
 
         if not sig:
             return None, None
         sig_str = str(sig)
+        details = None
         if kwargs.get("confirm_transaction_flag", True):
-            details = await self.confirm_transaction(sig, timeout_seconds=kwargs.get("confirmation_timeout_seconds"))
-            return sig_str, details
-        return sig_str, None
+            details = await self.confirm_transaction(
+                sig, timeout_s_override=kwargs.get("confirmation_timeout_seconds")
+            )
+        return sig_str, details

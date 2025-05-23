@@ -1,91 +1,75 @@
-import asyncio
+# src/monitoring/logs_listener.py
+
 import json
-import logging
-from typing import Any, Awaitable, Callable
-
+import asyncio
 import websockets
-
 from solders.pubkey import Pubkey
-
-from src.core.client import SolanaClient
-from src.monitoring.logs_event_processor import LogsEventProcessor
-
-logger = logging.getLogger(__name__)
+from .logs_event_processor import LogsEventProcessor
 
 
 class LogsListener:
     """
-    Connects to a Solana logs WebSocket, subscribes to all logs
-    matching the processor’s discriminator, and invokes a callback
-    for each parsed token event.
+    Subscribes to Solana program logs via logsSubscribe and
+    hands parsed TokenInfo objects off to the PumpTrader.
     """
 
     def __init__(
         self,
+        client,
+        token_queue: asyncio.Queue,
         wss_endpoint: str,
-        processor: LogsEventProcessor,
-        client: SolanaClient,
-    ) -> None:
-        self.wss_endpoint = wss_endpoint
-        self.processor = processor
+        program_id: Pubkey,
+        discriminator: str,
+    ):
         self.client = client
+        self.queue = token_queue
+        self.wss_endpoint = wss_endpoint
+        self.program_id = program_id
+        self.processor = LogsEventProcessor(discriminator, program_id)
+        self._ws = None
+        self._running = False
 
     async def listen_for_tokens(
         self,
-        token_callback: Callable[[Any], Awaitable[None]],
-    ) -> None:
+        token_callback,
+        match_string=None,
+        creator_address=None,
+    ):
         """
-        token_callback: coroutine that takes a token-info dict.
-        The 8-byte discriminator is now taken from self.processor.discriminator.
+        Connects to the WebSocket, subscribes to logs, and
+        for each new TokenInfo extracted calls token_callback.
         """
-        discriminator = self.processor.discriminator
-
-        # open the WebSocket
+        self._running = True
         async with websockets.connect(self.wss_endpoint) as ws:
-            # subscribe to logs that mention our event discriminator
-            subscribe = {
+            self._ws = ws
+            # subscribe to logs mentioning our program ID
+            await ws.send(json.dumps({
                 "jsonrpc": "2.0",
                 "id": 1,
                 "method": "logsSubscribe",
                 "params": [
-                    {"mentions": [discriminator]},
-                    {"commitment": self.client.commitment.name.lower()},
+                    {"mentions": [str(self.program_id)]},
+                    {"commitment": "confirmed"},
                 ],
-            }
-            await ws.send(json.dumps(subscribe))
-            confirmation = json.loads(await ws.recv())
-            sub_id = confirmation.get("result")
-            logger.info(f"Logs subscription confirmed (ID={sub_id})")
+            }))
+            # wait for the confirmation
+            await ws.recv()
 
-            # process incoming notifications until cancelled
-            await self._process_messages(ws, sub_id, token_callback)
+            while self._running:
+                raw = await ws.recv()
+                msg = json.loads(raw)
+                result = msg.get("params", {}).get("result")
+                if not result:
+                    continue
 
-    async def _process_messages(
-        self,
-        ws: websockets.WebSocketClientProtocol,
-        sub_id: Any,
-        token_callback: Callable[[Any], Awaitable[None]],
-    ) -> None:
-        """
-        Internal loop: receive every logsNotification, hand logs
-        to the LogsEventProcessor, then invoke the trader’s callback.
-        """
-        while True:
-            raw = await ws.recv()
-            msg = json.loads(raw)
-
-            # ensure this is a log notification for our subscription
-            if msg.get("method") != "logsNotification":
-                continue
-            params = msg.get("params", {})
-            if params.get("subscription") != sub_id:
-                continue
-
-            logs = params.get("params", {}).get("result", {}).get("logs", [])
-            try:
-                # parse the batch of logs into a token_info dict
-                token_info = await self.processor.parse_log_batch(logs)
-                if token_info:
+                for token_info in self.processor.extract_new_tokens(
+                    result, match_string, creator_address
+                ):
+                    # enqueue or directly callback, as your PumpTrader expects
                     await token_callback(token_info)
-            except Exception as e:
-                logger.error(f"Error in LogsListener._process_messages: {e}", exc_info=True)
+
+    async def stop(self):
+        """Stops listening and closes the WebSocket."""
+        self._running = False
+        if self._ws:
+            await self._ws.close()
